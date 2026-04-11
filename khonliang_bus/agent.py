@@ -1,7 +1,7 @@
 """BaseAgent — the base class every agent inherits from.
 
-Handles lifecycle boilerplate (port binding, registration, heartbeat,
-shutdown) so agent authors focus on skills, not plumbing.
+Connects to the bus via WebSocket. No port binding, no HTTP server.
+Agent authors subclass BaseAgent, define skills + handlers, and run.
 
 Usage::
 
@@ -40,8 +40,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import httpx
-from fastapi import FastAPI
-import uvicorn
+
+from khonliang_bus.connector import BusConnector
 
 logger = logging.getLogger(__name__)
 
@@ -101,10 +101,14 @@ def handler(operation: str) -> Callable:
 
 
 class BaseAgent:
-    """Base class for bus agents. Subclass and override skills + handlers."""
+    """Base class for bus agents. Connects via WebSocket — no HTTP server needed.
+
+    Subclass and override :meth:`register_skills` and ``@handler`` methods.
+    """
 
     agent_type: str = "base"
     module_name: str = "agent"
+    version: str = "0.0.0"
 
     def __init__(
         self,
@@ -116,9 +120,7 @@ class BaseAgent:
         self.bus_url = bus_url.rstrip("/")
         self.config_path = config_path
         self._http = httpx.AsyncClient(timeout=30.0)
-        self._heartbeat_task: asyncio.Task | None = None
-        self._server: uvicorn.Server | None = None
-        self._port: int = 0
+        self._connector: BusConnector | None = None
         self._handlers: dict[str, Callable] = {}
         self._collect_handlers()
 
@@ -168,29 +170,50 @@ class BaseAgent:
         return agent
 
     async def start(self) -> None:
-        """Bind port, register with bus, start heartbeat, serve requests."""
-        app = self._build_app()
-        config = uvicorn.Config(app, host="0.0.0.0", port=0, log_level="warning")
-        self._server = uvicorn.Server(config)
+        """Connect to bus via WebSocket, register, and handle requests.
 
-        # Start the server in background to discover the assigned port
-        serve_task = asyncio.create_task(self._server.serve())
+        No port binding, no HTTP server. The agent is a pure WebSocket
+        client. The bus sends requests over the same connection.
+        """
+        skills = self.register_skills()
+        collabs = self.register_collaborations()
 
-        # Wait for the server to start and discover the port
-        while not self._server.started:
-            await asyncio.sleep(0.05)
+        self._connector = BusConnector(
+            bus_url=self.bus_url,
+            agent_id=self.agent_id,
+            on_request=self._dispatch_request,
+        )
 
-        for sock in self._server.servers[0].sockets:
-            self._port = sock.getsockname()[1]
-            break
+        # Connect and register (raises RuntimeError if bus is unreachable)
+        await self._connector.connect_and_register(
+            agent_type=self.agent_type,
+            version=self.version,
+            pid=os.getpid(),
+            skills=[
+                {
+                    "name": s.name,
+                    "description": s.description,
+                    "parameters": s.parameters,
+                    "since": s.since,
+                }
+                for s in skills
+            ],
+            collaborations=[
+                {
+                    "name": c.name,
+                    "description": c.description,
+                    "requires": c.requires,
+                    "steps": c.steps,
+                }
+                for c in collabs
+            ],
+        )
 
-        logger.info("Agent %s listening on port %d", self.agent_id, self._port)
-
-        # Register with bus
-        await self._register()
-
-        # Start heartbeat loop
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        logger.info(
+            "Agent %s started (%d skills, WebSocket)",
+            self.agent_id,
+            len(skills),
+        )
 
         # Handle signals for clean shutdown (not supported on all platforms)
         try:
@@ -198,27 +221,39 @@ class BaseAgent:
             for sig in (signal.SIGTERM, signal.SIGINT):
                 loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
         except NotImplementedError:
-            pass  # Windows / some event loops don't support signal handlers
+            pass
 
-        await serve_task
+        # Run the WebSocket message loop (blocks until disconnect)
+        await self._connector.run()
 
     async def shutdown(self) -> None:
-        """Deregister and stop."""
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-        try:
-            await self._http.post(
-                f"{self.bus_url}/v1/deregister",
-                json={"id": self.agent_id},
-            )
-        except Exception:
-            pass
-        if self._server:
-            self._server.should_exit = True
+        """Disconnect from bus."""
+        if self._connector:
+            await self._connector.disconnect()
         await self._http.aclose()
         logger.info("Agent %s shut down", self.agent_id)
 
-    # -- install/uninstall --
+    # -- request dispatch --
+
+    async def _dispatch_request(self, msg: dict) -> Any:
+        """Route a bus request to the matching @handler method."""
+        operation = msg.get("operation", "")
+        args = msg.get("args", {})
+
+        handler_fn = self._handlers.get(operation)
+        if not handler_fn:
+            return {
+                "error": f"unknown operation: {operation}",
+                "retryable": False,
+            }
+
+        try:
+            return await handler_fn(args)
+        except Exception as e:
+            logger.exception("Handler %s failed", operation)
+            return {"error": str(e), "retryable": True}
+
+    # -- install/uninstall (HTTP — these are one-shot, not WebSocket) --
 
     def _do_install(self) -> None:
         """Synchronous install — called from from_cli when command is 'install'."""
@@ -247,116 +282,17 @@ class BaseAgent:
             except (json.JSONDecodeError, ValueError):
                 print(r.text)
 
-    # -- registration --
-
-    async def _register(self) -> None:
-        skills = self.register_skills()
-        collabs = self.register_collaborations()
-        callback = f"http://localhost:{self._port}"
-
-        payload = {
-            "id": self.agent_id,
-            "callback": callback,
-            "pid": os.getpid(),
-            "version": getattr(self, "version", "0.0.0"),
-            "skills": [
-                {
-                    "name": s.name,
-                    "description": s.description,
-                    "parameters": s.parameters,
-                    "since": s.since,
-                }
-                for s in skills
-            ],
-            "collaborations": [
-                {
-                    "name": c.name,
-                    "description": c.description,
-                    "requires": c.requires,
-                    "steps": c.steps,
-                }
-                for c in collabs
-            ],
-        }
-
-        try:
-            r = await self._http.post(f"{self.bus_url}/v1/register", json=payload)
-            r.raise_for_status()
-            logger.info("Registered with bus: %s", r.json())
-        except Exception as e:
-            raise RuntimeError(
-                f"Agent {self.agent_id} failed to register with bus at "
-                f"{self.bus_url}: {e}. The bus must be running before "
-                f"agents can start."
-            ) from e
-
-    # -- heartbeat --
-
-    async def _heartbeat_loop(self, interval: float = 30.0) -> None:
-        while True:
-            try:
-                await asyncio.sleep(interval)
-                await self._http.post(
-                    f"{self.bus_url}/v1/heartbeat",
-                    json={"id": self.agent_id},
-                )
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.warning("Heartbeat failed: %s", e)
-
-    # -- request handling --
-
-    def _build_app(self) -> FastAPI:
-        app = FastAPI()
-
-        @app.post("/v1/handle")
-        async def handle(request: dict):
-            operation = request.get("operation", "")
-            args = request.get("args", {})
-            correlation_id = request.get("correlation_id", "")
-
-            handler_fn = self._handlers.get(operation)
-            if not handler_fn:
-                return {
-                    "correlation_id": correlation_id,
-                    "error": f"unknown operation: {operation}",
-                    "retryable": False,
-                }
-
-            try:
-                result = await handler_fn(args)
-                return {
-                    "correlation_id": correlation_id,
-                    "result": result,
-                }
-            except Exception as e:
-                logger.exception("Handler %s failed", operation)
-                return {
-                    "correlation_id": correlation_id,
-                    "error": str(e),
-                    "retryable": True,
-                }
-
-        @app.get("/v1/health")
-        def health():
-            return {"status": "ok", "agent_id": self.agent_id}
-
-        return app
-
     # -- pub/sub helpers --
 
-    async def publish(self, topic: str, payload: Any) -> dict:
-        """Publish an event to the bus."""
-        r = await self._http.post(
-            f"{self.bus_url}/v1/publish",
-            json={"topic": topic, "payload": payload, "source": self.agent_id},
-        )
-        return r.json()
+    async def publish(self, topic: str, payload: Any) -> None:
+        """Publish an event through the bus (via WebSocket)."""
+        if self._connector:
+            await self._connector.publish(topic, payload)
 
-    async def nack(self, message_id: str, topic: str, reason: str = "") -> dict:
+    async def nack(self, message_id: str, topic: str, reason: str = "") -> None:
         """Negative-acknowledge a message for redelivery."""
-        r = await self._http.post(
+        # NACK goes via HTTP since it's not part of the WebSocket protocol
+        await self._http.post(
             f"{self.bus_url}/v1/nack",
             json={
                 "subscriber_id": self.agent_id,
@@ -365,23 +301,13 @@ class BaseAgent:
                 "reason": reason,
             },
         )
-        return r.json()
 
     # -- session context --
 
     async def get_session_context(
         self, session_id: str, scope: str = "public"
     ) -> dict[str, Any]:
-        """Read session context from the bus.
-
-        Args:
-            session_id: The session to read.
-            scope: ``"public"`` (default, any agent can read) or ``"private"``
-                   (only the owning agent should request this).
-
-        Returns:
-            Dict with ``session_id``, ``status``, and ``public``/``private`` context.
-        """
+        """Read session context from the bus."""
         r = await self._http.get(
             f"{self.bus_url}/v1/session/{session_id}/context",
             params={"scope": scope},
@@ -394,11 +320,7 @@ class BaseAgent:
         public: dict[str, Any] | None = None,
         private: dict[str, Any] | None = None,
     ) -> dict:
-        """Write session context to the bus.
-
-        Partial updates: passing only ``public`` doesn't overwrite
-        ``private``, and vice versa.
-        """
+        """Write session context to the bus."""
         body: dict[str, Any] = {}
         if public is not None:
             body["public_ctx"] = public
@@ -419,29 +341,28 @@ class BaseAgent:
         operation: str = "",
         args: dict[str, Any] | None = None,
         timeout: float = 30.0,
+        response_mode: str = "raw",
     ) -> dict:
-        """Make a request to another agent via the bus.
-
-        Routes through the bus's /v1/request endpoint. The bus resolves
-        the target agent (by ID or by type) and forwards the request.
-
-        Args:
-            agent_id: Target agent ID (exact).
-            agent_type: Target agent type (bus picks a healthy instance).
-            operation: The skill to invoke on the target.
-            args: Arguments to pass.
-            timeout: Request timeout in seconds.
-
-        Returns:
-            Dict with ``result`` on success or ``error`` on failure.
-        """
-        payload: dict[str, Any] = {"operation": operation, "args": args or {}, "timeout": timeout}
+        """Make a request to another agent via the bus."""
+        payload: dict[str, Any] = {
+            "operation": operation,
+            "args": args or {},
+            "timeout": timeout,
+            "response_mode": response_mode,
+        }
         if agent_id:
             payload["agent_id"] = agent_id
         elif agent_type:
             payload["agent_type"] = agent_type
         r = await self._http.post(f"{self.bus_url}/v1/request", json=payload)
         return r.json()
+
+    # -- gap reporting --
+
+    async def report_gap(self, operation: str, reason: str, context: dict | None = None) -> None:
+        """Report a capability gap through the bus (via WebSocket)."""
+        if self._connector:
+            await self._connector.report_gap(operation, reason, context)
 
     # -- from_mcp migration helper --
 
@@ -458,22 +379,18 @@ class BaseAgent:
 
         Introspects the server's registered tools and creates a BaseAgent
         subclass with @handler for each tool. The tool functions stay
-        identical — only the transport changes from stdio to bus HTTP.
+        identical — only the transport changes from stdio to bus WebSocket.
 
         This is a migration bridge. The end state is native @handler
         methods, not wrapped MCP tools.
 
         Note: calls ``asyncio.run(mcp_server.list_tools())`` to introspect
-        tools. Must be called outside an existing event loop (not from
-        async code). For async contexts, introspect the server's tools
-        separately and construct the agent manually.
+        tools. Must be called outside an existing event loop.
         """
         import asyncio as _aio
 
-        # Introspect MCP tools (requires no running event loop)
         tools = _aio.run(mcp_server.list_tools())
 
-        # Build dynamic subclass
         handlers = {}
         skills = []
 
@@ -482,15 +399,12 @@ class BaseAgent:
             skills.append(Skill(
                 name=tool_name,
                 description=tool.description or "",
-                parameters={},  # could extract from tool.inputSchema
+                parameters={},
             ))
 
-            # Create a handler that wraps the MCP tool call.
-            # Use a closure over tool_name to capture the correct value.
             def _make_handler(tn):
                 async def _handler(self_inner, args):
                     result = await mcp_server.call_tool(tn, args)
-                    # MCP tools return [TextContent, ...] — extract text
                     if isinstance(result, tuple) and len(result) == 2:
                         meta = result[1]
                         if isinstance(meta, dict) and "result" in meta:
@@ -506,7 +420,6 @@ class BaseAgent:
             setattr(handler_fn, _HANDLER_ATTR, tool_name)
             handlers[tool_name] = handler_fn
 
-        # Create the subclass
         agent_cls = type(
             f"{agent_type.title()}Agent",
             (cls,),
@@ -516,7 +429,6 @@ class BaseAgent:
             },
         )
 
-        # Override register_skills
         def _register_skills(self_inner):
             return skills
         agent_cls.register_skills = _register_skills

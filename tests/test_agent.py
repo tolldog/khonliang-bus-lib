@@ -1,4 +1,4 @@
-"""Tests for BaseAgent: skills, handlers, registration, session context, request helper."""
+"""Tests for BaseAgent: skills, handlers, connector-based lifecycle."""
 
 from __future__ import annotations
 
@@ -78,45 +78,25 @@ def test_handlers_collected(agent):
     assert set(agent._handlers) == {"echo", "upper", "fail"}
 
 
-def test_handler_success(agent):
-    app = agent._build_app()
-    from fastapi.testclient import TestClient
-    c = TestClient(app)
-    r = c.post("/v1/handle", json={
-        "operation": "echo", "args": {"text": "hello"}, "correlation_id": "c1",
-    }).json()
-    assert r["result"] == {"echoed": "hello"}
-    assert r["correlation_id"] == "c1"
+@pytest.mark.asyncio
+async def test_dispatch_success(agent):
+    result = await agent._dispatch_request({"operation": "echo", "args": {"text": "hello"}})
+    assert result == {"echoed": "hello"}
 
 
-def test_handler_failure(agent):
-    app = agent._build_app()
-    from fastapi.testclient import TestClient
-    c = TestClient(app)
-    r = c.post("/v1/handle", json={
-        "operation": "fail", "args": {}, "correlation_id": "c2",
-    }).json()
-    assert "intentional" in r["error"]
-    assert r["retryable"] is True
+@pytest.mark.asyncio
+async def test_dispatch_failure(agent):
+    result = await agent._dispatch_request({"operation": "fail", "args": {}})
+    assert "error" in result
+    assert "intentional" in result["error"]
+    assert result["retryable"] is True
 
 
-def test_handler_unknown_operation(agent):
-    app = agent._build_app()
-    from fastapi.testclient import TestClient
-    c = TestClient(app)
-    r = c.post("/v1/handle", json={
-        "operation": "nope", "args": {}, "correlation_id": "c3",
-    }).json()
-    assert "unknown operation" in r["error"]
-    assert r["retryable"] is False
-
-
-def test_health_endpoint(agent):
-    app = agent._build_app()
-    from fastapi.testclient import TestClient
-    c = TestClient(app)
-    r = c.get("/v1/health").json()
-    assert r["agent_id"] == "echo-test"
+@pytest.mark.asyncio
+async def test_dispatch_unknown_operation(agent):
+    result = await agent._dispatch_request({"operation": "nope", "args": {}})
+    assert "unknown operation" in result["error"]
+    assert result["retryable"] is False
 
 
 # -- CLI --
@@ -127,20 +107,13 @@ def test_from_cli():
     assert a.bus_url == "http://localhost:8787"
 
 
-# -- registration failure --
+# -- start fails when bus unreachable --
 
-def test_register_fails_fatally():
+@pytest.mark.asyncio
+async def test_start_fails_when_bus_unreachable():
     a = EchoAgent(agent_id="test-fatal", bus_url="http://localhost:1")
-    with pytest.raises(RuntimeError, match="failed to register"):
-        a._build_app()
-        asyncio.run(a._register())
-
-
-def test_register_error_includes_bus_url():
-    a = EchoAgent(agent_id="test-msg", bus_url="http://localhost:1")
-    with pytest.raises(RuntimeError, match="localhost:1"):
-        a._build_app()
-        asyncio.run(a._register())
+    with pytest.raises(RuntimeError, match="failed to connect"):
+        await a.start()
 
 
 # -- helpers exist --
@@ -162,5 +135,15 @@ def test_session_context_helpers_exist(agent):
     assert asyncio.iscoroutinefunction(agent.update_session_context)
 
 
+def test_report_gap_is_async(agent):
+    assert asyncio.iscoroutinefunction(agent.report_gap)
+
+
 def test_version_attribute(agent):
     assert agent.version == "0.2.0"
+
+
+def test_no_fastapi_dependency(agent):
+    """BaseAgent should NOT use FastAPI/uvicorn — pure WebSocket client."""
+    assert not hasattr(agent, "_build_app")
+    assert agent._connector is None

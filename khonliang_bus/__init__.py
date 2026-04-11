@@ -36,10 +36,12 @@ __version__ = "0.1.0"
 
 from khonliang_bus.agent import BaseAgent, Collaboration, Skill, handler
 from khonliang_bus.client import BusClient, Message
+from khonliang_bus.connector import BusConnector
 
 __all__ = [
     "BaseAgent",
     "BusClient",
+    "BusConnector",
     "Collaboration",
     "Message",
     "Skill",

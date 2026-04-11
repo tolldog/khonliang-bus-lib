@@ -130,7 +130,7 @@ class BusClient:
             {"subscriber_id": self.subscriber_id, "message_id": message_id},
         )
 
-    def nack(self, message_id: int, topic: str, reason: str = "") -> None:
+    def nack(self, message_id: str, topic: str, reason: str = "") -> None:
         """Negative-acknowledge: request redelivery of a message.
 
         Rolls back the ack position so this message (and any after it)

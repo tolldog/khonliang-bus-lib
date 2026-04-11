@@ -198,7 +198,7 @@ class BusConnector:
 
         if msg_type == "request" and self._on_request:
             # Dispatch to the agent's handler.
-            # Handlers raise HandlerError for transport-level errors;
+            # Handlers raise exceptions for transport-level errors;
             # any dict they return (even one with an "error" key) is a
             # legitimate payload and gets sent as a response.
             try:
@@ -223,7 +223,7 @@ class BusConnector:
         """Send a message to the bus.
 
         Logs a warning and drops the message if the WebSocket is not open.
-        Callers that need a guaranteed-delivery guarantee should check
+        Callers that need delivery guarantees should check
         :attr:`connected` themselves (or use the higher-level
         :meth:`~khonliang_bus.agent.BaseAgent.publish` which raises on disconnect).
         """

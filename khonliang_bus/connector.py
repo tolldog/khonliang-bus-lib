@@ -116,14 +116,15 @@ class BusConnector:
         """
         self._running = True
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        delay = self._reconnect_delay
+        initial_delay = self._reconnect_delay
+        delay = initial_delay
 
         while self._running:
             try:
                 async for raw in self._ws:
                     msg = json.loads(raw)
                     await self._handle_bus_message(msg)
-                    delay = self._reconnect_delay  # reset on successful message
+                    delay = initial_delay  # reset on successful message
 
                 # Clean close
                 if not self._running:
@@ -149,7 +150,7 @@ class BusConnector:
                         resp = json.loads(await self._ws.recv())
                         if resp.get("type") == "registered":
                             self._registered = True
-                            delay = self._reconnect_delay  # reset after successful reconnect
+                            delay = initial_delay  # reset after successful reconnect
                             logger.info("Agent %s reconnected and re-registered", self.agent_id)
                 except Exception as e:
                     logger.warning("Reconnect failed: %s", e)

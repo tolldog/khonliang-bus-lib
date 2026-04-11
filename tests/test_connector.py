@@ -61,11 +61,11 @@ async def test_connect_error_includes_bus_url():
 
 
 @pytest.mark.asyncio
-async def test_send_is_noop_when_not_connected():
-    """send() must not raise when there is no active WebSocket."""
+async def test_send_raises_when_not_connected():
+    """send() raises ConnectionError when no WebSocket is active."""
     c = BusConnector("http://localhost:8787", "test")
-    # _ws is None — should silently drop without raising
-    await c.send({"type": "heartbeat"})
+    with pytest.raises(ConnectionError, match="not connected"):
+        await c.send({"type": "heartbeat"})
 
 
 @pytest.mark.asyncio
@@ -111,12 +111,38 @@ async def test_handle_bus_message_request_dispatched():
 
 
 @pytest.mark.asyncio
-async def test_handle_bus_message_request_error_returned():
-    """When on_request returns an error dict, an 'error' frame is sent."""
+async def test_handle_bus_message_request_error_dict_is_legit_payload():
+    """Handler returning a dict with 'error' key is a legitimate response, not a transport error."""
     sent = []
 
     async def _on_request(msg):
-        return {"error": "not found", "retryable": False}
+        return {"error": "not found", "detail": "no matching paper"}
+
+    async def _fake_send(msg):
+        sent.append(msg)
+
+    c = BusConnector("http://localhost:8787", "test", on_request=_on_request)
+    c.send = _fake_send
+
+    await c._handle_bus_message({
+        "type": "request",
+        "correlation_id": "xyz",
+        "operation": "find",
+        "args": {},
+    })
+
+    # Should be sent as a response, not an error — the handler chose to return this
+    assert sent[0]["type"] == "response"
+    assert sent[0]["result"]["error"] == "not found"
+
+
+@pytest.mark.asyncio
+async def test_handle_bus_message_request_exception_sends_error():
+    """Handler raising an exception IS a transport error → error frame."""
+    sent = []
+
+    async def _on_request(msg):
+        raise RuntimeError("handler crashed")
 
     async def _fake_send(msg):
         sent.append(msg)
@@ -132,6 +158,4 @@ async def test_handle_bus_message_request_error_returned():
     })
 
     assert sent[0]["type"] == "error"
-    assert sent[0]["correlation_id"] == "xyz"
-    assert sent[0]["error"] == "not found"
-    assert sent[0]["retryable"] is False
+    assert "handler crashed" in sent[0]["error"]

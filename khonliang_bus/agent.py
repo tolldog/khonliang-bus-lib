@@ -184,8 +184,10 @@ class BaseAgent:
             on_request=self._dispatch_request,
         )
 
-        # Connect and register (raises RuntimeError if bus is unreachable)
-        await self._connector.connect_and_register(
+        # Connect and register (raises RuntimeError if bus is unreachable).
+        # Wrap in try/finally so _http is cleaned up on failure.
+        try:
+            await self._connector.connect_and_register(
             agent_type=self.agent_type,
             version=self.version,
             pid=os.getpid(),
@@ -209,6 +211,10 @@ class BaseAgent:
             ],
         )
 
+        except Exception:
+            await self._http.aclose()
+            raise
+
         logger.info(
             "Agent %s started (%d skills, WebSocket)",
             self.agent_id,
@@ -224,7 +230,10 @@ class BaseAgent:
             pass
 
         # Run the WebSocket message loop (blocks until disconnect)
-        await self._connector.run()
+        try:
+            await self._connector.run()
+        finally:
+            await self._http.aclose()
 
     async def shutdown(self) -> None:
         """Disconnect from bus."""
@@ -236,22 +245,21 @@ class BaseAgent:
     # -- request dispatch --
 
     async def _dispatch_request(self, msg: dict) -> Any:
-        """Route a bus request to the matching @handler method."""
+        """Route a bus request to the matching @handler method.
+
+        Raises exceptions for transport-level errors (unknown operation,
+        handler crashes). The connector catches these and sends an error
+        message to the bus. Handler return values — even dicts with an
+        "error" key — are treated as legitimate payloads.
+        """
         operation = msg.get("operation", "")
         args = msg.get("args", {})
 
         handler_fn = self._handlers.get(operation)
         if not handler_fn:
-            return {
-                "error": f"unknown operation: {operation}",
-                "retryable": False,
-            }
+            raise ValueError(f"unknown operation: {operation}")
 
-        try:
-            return await handler_fn(args)
-        except Exception as e:
-            logger.exception("Handler %s failed", operation)
-            return {"error": str(e), "retryable": True}
+        return await handler_fn(args)
 
     # -- install/uninstall (HTTP — these are one-shot, not WebSocket) --
 

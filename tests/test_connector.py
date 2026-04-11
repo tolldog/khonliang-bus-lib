@@ -132,5 +132,6 @@ async def test_handle_bus_message_request_error_returned():
     })
 
     assert sent[0]["type"] == "error"
+    assert sent[0]["correlation_id"] == "xyz"
     assert sent[0]["error"] == "not found"
     assert sent[0]["retryable"] is False

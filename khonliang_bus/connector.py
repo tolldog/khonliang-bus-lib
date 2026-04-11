@@ -112,7 +112,7 @@ class BusConnector:
         """Main loop: receive messages from bus, dispatch requests.
 
         Runs until the connection is closed or :meth:`disconnect` is called.
-        Auto-reconnects on connection loss.
+        Auto-reconnects on connection loss with exponential backoff.
         """
         self._running = True
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
@@ -120,67 +120,63 @@ class BusConnector:
         delay = initial_delay
 
         while self._running:
+            # If a previous reconnect failed, _ws is None; skip straight to reconnect.
+            if self._ws is not None:
+                connection_lost = False
+                try:
+                    async for raw in self._ws:
+                        msg = json.loads(raw)
+                        await self._handle_bus_message(msg)
+                        delay = initial_delay  # reset on successful message
+
+                    # Clean close: async-for ended normally.
+                    # Treat as a connection loss while still running.
+                    connection_lost = self._running
+
+                except websockets.ConnectionClosed:
+                    connection_lost = self._running
+
+                except Exception as e:
+                    if not self._running:
+                        break
+                    logger.error("Agent %s unexpected error: %s", self.agent_id, e)
+                    await asyncio.sleep(delay)
+                    continue
+
+                if not self._running:
+                    break
+
+                if not connection_lost:
+                    continue
+
+            logger.warning(
+                "Agent %s reconnecting to bus in %.1fs",
+                self.agent_id, delay,
+            )
+            self._registered = False
+            self._ws = None  # Clear before sleeping so heartbeat won't use the closed socket
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, self._max_reconnect_delay)
+
+            # Reconnect and re-register using a local variable so _ws is only
+            # replaced after a fully successful handshake.
             try:
-                async for raw in self._ws:
-                    msg = json.loads(raw)
-                    await self._handle_bus_message(msg)
-                    delay = initial_delay  # reset on successful message
-
-                # Clean close — the async for ended normally. If we're
-                # still supposed to be running, treat it like a connection
-                # loss and reconnect with backoff.
-                if not self._running:
-                    break
-                logger.warning(
-                    "Agent %s WebSocket closed cleanly, reconnecting in %.1fs",
-                    self.agent_id, delay,
-                )
-                self._registered = False
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, self._max_reconnect_delay)
-                try:
-                    ws_url = self._ws_url("/v1/agent")
-                    self._ws = await websockets.connect(ws_url)
-                    if self._registration_payload:
-                        await self._ws.send(json.dumps(self._registration_payload))
-                        resp = json.loads(await self._ws.recv())
-                        if resp.get("type") == "registered":
-                            self._registered = True
-                            delay = initial_delay
-                            logger.info("Agent %s reconnected", self.agent_id)
-                except Exception as e:
-                    logger.warning("Reconnect after clean close failed: %s", e)
-
-            except websockets.ConnectionClosed:
-                if not self._running:
-                    break
-                logger.warning(
-                    "Agent %s lost connection to bus, reconnecting in %.1fs",
-                    self.agent_id, delay,
-                )
-                self._registered = False
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, self._max_reconnect_delay)
-
-                # Reconnect and re-register
-                try:
-                    ws_url = self._ws_url("/v1/agent")
-                    self._ws = await websockets.connect(ws_url)
-                    if self._registration_payload:
-                        await self._ws.send(json.dumps(self._registration_payload))
-                        resp = json.loads(await self._ws.recv())
-                        if resp.get("type") == "registered":
-                            self._registered = True
-                            delay = initial_delay  # reset after successful reconnect
-                            logger.info("Agent %s reconnected and re-registered", self.agent_id)
-                except Exception as e:
-                    logger.warning("Reconnect failed: %s", e)
-
+                ws_url = self._ws_url("/v1/agent")
+                new_ws = await websockets.connect(ws_url)
+                if self._registration_payload:
+                    await new_ws.send(json.dumps(self._registration_payload))
+                    resp = json.loads(await new_ws.recv())
+                    if resp.get("type") != "registered":
+                        await new_ws.close()
+                        raise RuntimeError(
+                            f"Agent {self.agent_id} re-registration rejected: {resp!r}"
+                        )
+                self._registered = True
+                delay = initial_delay  # reset after successful reconnect
+                logger.info("Agent %s reconnected and re-registered", self.agent_id)
+                self._ws = new_ws  # Only assign after full successful handshake
             except Exception as e:
-                if not self._running:
-                    break
-                logger.error("Agent %s unexpected error: %s", self.agent_id, e)
-                await asyncio.sleep(delay)
+                logger.warning("Reconnect failed: %s", e)
 
     async def _handle_bus_message(self, msg: dict) -> None:
         """Dispatch a message received from the bus."""
@@ -210,13 +206,19 @@ class BusConnector:
             await self.send({"type": "pong"})
 
     async def send(self, msg: dict) -> None:
-        """Send a message to the bus. Raises ConnectionError if not connected."""
+        """Send a message to the bus.
+
+        Logs a warning and drops the message if the WebSocket is not open.
+        Callers that need a guaranteed-delivery guarantee should check
+        :attr:`connected` themselves (or use the higher-level
+        :meth:`~khonliang_bus.agent.BaseAgent.publish` which raises on disconnect).
+        """
         if self._ws and self._ws.open:
             await self._ws.send(json.dumps(msg))
         else:
-            raise ConnectionError(
-                f"Agent {self.agent_id}: cannot send (not connected). "
-                f"Message type={msg.get('type')}"
+            logger.warning(
+                "Agent %s: message dropped (not connected): type=%s",
+                self.agent_id, msg.get("type"),
             )
 
     async def publish(self, topic: str, payload: Any) -> None:

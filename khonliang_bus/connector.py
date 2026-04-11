@@ -126,9 +126,30 @@ class BusConnector:
                     await self._handle_bus_message(msg)
                     delay = initial_delay  # reset on successful message
 
-                # Clean close
+                # Clean close — the async for ended normally. If we're
+                # still supposed to be running, treat it like a connection
+                # loss and reconnect with backoff.
                 if not self._running:
                     break
+                logger.warning(
+                    "Agent %s WebSocket closed cleanly, reconnecting in %.1fs",
+                    self.agent_id, delay,
+                )
+                self._registered = False
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, self._max_reconnect_delay)
+                try:
+                    ws_url = self._ws_url("/v1/agent")
+                    self._ws = await websockets.connect(ws_url)
+                    if self._registration_payload:
+                        await self._ws.send(json.dumps(self._registration_payload))
+                        resp = json.loads(await self._ws.recv())
+                        if resp.get("type") == "registered":
+                            self._registered = True
+                            delay = initial_delay
+                            logger.info("Agent %s reconnected", self.agent_id)
+                except Exception as e:
+                    logger.warning("Reconnect after clean close failed: %s", e)
 
             except websockets.ConnectionClosed:
                 if not self._running:
@@ -166,22 +187,17 @@ class BusConnector:
         msg_type = msg.get("type", "")
 
         if msg_type == "request" and self._on_request:
-            # Dispatch to the agent's handler
+            # Dispatch to the agent's handler.
+            # Handlers raise HandlerError for transport-level errors;
+            # any dict they return (even one with an "error" key) is a
+            # legitimate payload and gets sent as a response.
             try:
                 result = await self._on_request(msg)
-                if isinstance(result, dict) and "error" in result:
-                    await self.send({
-                        "type": "error",
-                        "correlation_id": msg.get("correlation_id", ""),
-                        "error": result["error"],
-                        "retryable": result.get("retryable", True),
-                    })
-                else:
-                    await self.send({
-                        "type": "response",
-                        "correlation_id": msg.get("correlation_id", ""),
-                        "result": result,
-                    })
+                await self.send({
+                    "type": "response",
+                    "correlation_id": msg.get("correlation_id", ""),
+                    "result": result,
+                })
             except Exception as e:
                 await self.send({
                     "type": "error",
@@ -194,13 +210,13 @@ class BusConnector:
             await self.send({"type": "pong"})
 
     async def send(self, msg: dict) -> None:
-        """Send a message to the bus."""
+        """Send a message to the bus. Raises ConnectionError if not connected."""
         if self._ws and self._ws.open:
             await self._ws.send(json.dumps(msg))
         else:
-            logger.debug(
-                "Agent %s: message dropped (not connected): type=%s",
-                self.agent_id, msg.get("type"),
+            raise ConnectionError(
+                f"Agent {self.agent_id}: cannot send (not connected). "
+                f"Message type={msg.get('type')}"
             )
 
     async def publish(self, topic: str, payload: Any) -> None:

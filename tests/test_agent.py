@@ -85,18 +85,16 @@ async def test_dispatch_success(agent):
 
 
 @pytest.mark.asyncio
-async def test_dispatch_failure(agent):
-    result = await agent._dispatch_request({"operation": "fail", "args": {}})
-    assert "error" in result
-    assert "intentional" in result["error"]
-    assert result["retryable"] is True
+async def test_dispatch_failure_raises(agent):
+    """Handler exceptions propagate — connector catches them and sends error to bus."""
+    with pytest.raises(ValueError, match="intentional"):
+        await agent._dispatch_request({"operation": "fail", "args": {}})
 
 
 @pytest.mark.asyncio
-async def test_dispatch_unknown_operation(agent):
-    result = await agent._dispatch_request({"operation": "nope", "args": {}})
-    assert "unknown operation" in result["error"]
-    assert result["retryable"] is False
+async def test_dispatch_unknown_operation_raises(agent):
+    with pytest.raises(ValueError, match="unknown operation"):
+        await agent._dispatch_request({"operation": "nope", "args": {}})
 
 
 # -- CLI --

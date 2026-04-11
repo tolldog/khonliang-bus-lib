@@ -57,9 +57,23 @@ class BusConnector:
         self._registration_payload: dict | None = None
         self._running = False
 
+    def _is_open(self) -> bool:
+        """Check if the WebSocket is connected and open.
+
+        websockets v14+ uses ``.state`` instead of ``.open``.
+        """
+        if self._ws is None:
+            return False
+        # websockets v14+: ClientConnection has .state (State enum)
+        if hasattr(self._ws, "state"):
+            from websockets.protocol import State
+            return self._ws.state == State.OPEN
+        # websockets legacy: WebSocketClientProtocol has .open
+        return getattr(self._ws, "open", False)
+
     @property
     def connected(self) -> bool:
-        return self._ws is not None and self._ws.open
+        return self._is_open()
 
     @property
     def registered(self) -> bool:
@@ -213,7 +227,7 @@ class BusConnector:
         :attr:`connected` themselves (or use the higher-level
         :meth:`~khonliang_bus.agent.BaseAgent.publish` which raises on disconnect).
         """
-        if self._ws and self._ws.open:
+        if self._ws and self._is_open():
             await self._ws.send(json.dumps(msg))
         else:
             logger.warning(
@@ -247,7 +261,7 @@ class BusConnector:
                 await self._heartbeat_task
             except asyncio.CancelledError:
                 pass
-        if self._ws and self._ws.open:
+        if self._ws and self._is_open():
             try:
                 await self.send({"type": "deregister"})
                 await self._ws.close()
@@ -260,7 +274,7 @@ class BusConnector:
         while self._running:
             try:
                 await asyncio.sleep(self._heartbeat_interval)
-                if self._ws and self._ws.open:
+                if self._ws and self._is_open():
                     await self.send({"type": "heartbeat"})
             except asyncio.CancelledError:
                 break

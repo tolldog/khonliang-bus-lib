@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 from typing import Any, Callable
+from urllib.parse import urlparse, urlunparse
 
 import websockets
 
@@ -148,6 +149,7 @@ class BusConnector:
                         resp = json.loads(await self._ws.recv())
                         if resp.get("type") == "registered":
                             self._registered = True
+                            delay = self._reconnect_delay  # reset after successful reconnect
                             logger.info("Agent %s reconnected and re-registered", self.agent_id)
                 except Exception as e:
                     logger.warning("Reconnect failed: %s", e)
@@ -194,6 +196,11 @@ class BusConnector:
         """Send a message to the bus."""
         if self._ws and self._ws.open:
             await self._ws.send(json.dumps(msg))
+        else:
+            logger.debug(
+                "Agent %s: message dropped (not connected): type=%s",
+                self.agent_id, msg.get("type"),
+            )
 
     async def publish(self, topic: str, payload: Any) -> None:
         """Publish an event through the bus."""
@@ -243,7 +250,6 @@ class BusConnector:
 
     def _ws_url(self, path: str) -> str:
         """Convert http(s) bus URL to ws(s) URL."""
-        url = self.bus_url
-        if url.startswith("https://"):
-            return url.replace("https://", "wss://", 1) + path
-        return url.replace("http://", "ws://", 1) + path
+        parsed = urlparse(self.bus_url + path)
+        scheme = "wss" if parsed.scheme == "https" else "ws"
+        return urlunparse(parsed._replace(scheme=scheme))

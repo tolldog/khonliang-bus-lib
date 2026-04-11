@@ -1,0 +1,23 @@
+[project]
+name = "khonliang-bus-lib"
+version = "0.1.0"
+description = "Agent library for the khonliang-bus platform — BaseAgent, BusClient, testing harness, and MCP adapter"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28",
+    "websockets>=14.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.0.0"]
+test = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+
+[tool.setuptools.packages.find]
+include = ["khonliang_bus*"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

@@ -120,6 +120,13 @@ def test_publish_is_async(agent):
     assert asyncio.iscoroutinefunction(agent.publish)
 
 
+@pytest.mark.asyncio
+async def test_publish_raises_when_not_connected(agent):
+    """publish() should raise RuntimeError before the agent connects to the bus."""
+    with pytest.raises(RuntimeError, match="not connected"):
+        await agent.publish("some.topic", {"data": 1})
+
+
 def test_nack_is_async(agent):
     assert asyncio.iscoroutinefunction(agent.nack)
 
@@ -135,6 +142,13 @@ def test_session_context_helpers_exist(agent):
 
 def test_report_gap_is_async(agent):
     assert asyncio.iscoroutinefunction(agent.report_gap)
+
+
+@pytest.mark.asyncio
+async def test_report_gap_raises_when_not_connected(agent):
+    """report_gap() should raise RuntimeError before the agent connects to the bus."""
+    with pytest.raises(RuntimeError, match="not connected"):
+        await agent.report_gap("do_something", "no handler available")
 
 
 def test_version_attribute(agent):

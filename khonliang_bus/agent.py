@@ -293,9 +293,17 @@ class BaseAgent:
     # -- pub/sub helpers --
 
     async def publish(self, topic: str, payload: Any) -> None:
-        """Publish an event through the bus (via WebSocket)."""
-        if self._connector:
-            await self._connector.publish(topic, payload)
+        """Publish an event through the bus (via WebSocket).
+
+        Raises:
+            RuntimeError: If the agent is not connected to the bus.
+        """
+        if not self._connector:
+            raise RuntimeError(
+                f"Agent {self.agent_id} is not connected to the bus. "
+                "Call start() before publishing."
+            )
+        await self._connector.publish(topic, payload)
 
     async def nack(self, message_id: str, topic: str, reason: str = "") -> None:
         """Negative-acknowledge a message for redelivery."""
@@ -368,9 +376,17 @@ class BaseAgent:
     # -- gap reporting --
 
     async def report_gap(self, operation: str, reason: str, context: dict | None = None) -> None:
-        """Report a capability gap through the bus (via WebSocket)."""
-        if self._connector:
-            await self._connector.report_gap(operation, reason, context)
+        """Report a capability gap through the bus (via WebSocket).
+
+        Raises:
+            RuntimeError: If the agent is not connected to the bus.
+        """
+        if not self._connector:
+            raise RuntimeError(
+                f"Agent {self.agent_id} is not connected to the bus. "
+                "Call start() before reporting gaps."
+            )
+        await self._connector.report_gap(operation, reason, context)
 
     # -- from_mcp migration helper --
 

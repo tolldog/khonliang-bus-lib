@@ -61,11 +61,11 @@ async def test_connect_error_includes_bus_url():
 
 
 @pytest.mark.asyncio
-async def test_send_raises_when_not_connected():
-    """send() raises ConnectionError when no WebSocket is active."""
+async def test_send_warns_when_not_connected():
+    """send() logs a warning and drops (does not raise) when no WebSocket is active."""
     c = BusConnector("http://localhost:8787", "test")
-    with pytest.raises(ConnectionError, match="not connected"):
-        await c.send({"type": "heartbeat"})
+    # _ws is None — should log warning but NOT raise
+    await c.send({"type": "heartbeat"})
 
 
 @pytest.mark.asyncio

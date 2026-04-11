@@ -60,6 +60,38 @@ async def test_connect_error_includes_bus_url():
         await c.connect_and_register("test", "0.1.0", 1, [])
 
 
+def test_is_open_v14_state():
+    """_is_open uses .state for websockets v14+ (no .open attribute)."""
+    from unittest.mock import MagicMock
+    from websockets.protocol import State
+
+    c = BusConnector("http://localhost:8787", "test")
+    mock_ws = MagicMock()
+    mock_ws.state = State.OPEN
+    del mock_ws.open  # v14+ doesn't have .open
+    c._ws = mock_ws
+    assert c._is_open() is True
+
+    mock_ws.state = State.CLOSED
+    assert c._is_open() is False
+
+
+def test_is_open_legacy_fallback():
+    """_is_open falls back to .open for legacy websockets."""
+    from unittest.mock import MagicMock
+
+    c = BusConnector("http://localhost:8787", "test")
+    mock_ws = MagicMock(spec=[])  # empty spec — no .state
+    mock_ws.open = True
+    c._ws = mock_ws
+    assert c._is_open() is True
+
+
+def test_is_open_none():
+    c = BusConnector("http://localhost:8787", "test")
+    assert c._is_open() is False
+
+
 @pytest.mark.asyncio
 async def test_send_warns_when_not_connected():
     """send() logs a warning and drops (does not raise) when no WebSocket is active."""

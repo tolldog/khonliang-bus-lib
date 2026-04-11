@@ -188,28 +188,28 @@ class BaseAgent:
         # Wrap in try/finally so _http is cleaned up on failure.
         try:
             await self._connector.connect_and_register(
-            agent_type=self.agent_type,
-            version=self.version,
-            pid=os.getpid(),
-            skills=[
-                {
-                    "name": s.name,
-                    "description": s.description,
-                    "parameters": s.parameters,
-                    "since": s.since,
-                }
-                for s in skills
-            ],
-            collaborations=[
-                {
-                    "name": c.name,
-                    "description": c.description,
-                    "requires": c.requires,
-                    "steps": c.steps,
-                }
-                for c in collabs
-            ],
-        )
+                agent_type=self.agent_type,
+                version=self.version,
+                pid=os.getpid(),
+                skills=[
+                    {
+                        "name": s.name,
+                        "description": s.description,
+                        "parameters": s.parameters,
+                        "since": s.since,
+                    }
+                    for s in skills
+                ],
+                collaborations=[
+                    {
+                        "name": c.name,
+                        "description": c.description,
+                        "requires": c.requires,
+                        "steps": c.steps,
+                    }
+                    for c in collabs
+                ],
+            )
 
         except Exception:
             await self._http.aclose()

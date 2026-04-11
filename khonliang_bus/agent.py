@@ -192,10 +192,13 @@ class BaseAgent:
         # Start heartbeat loop
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
-        # Handle signals for clean shutdown
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
+        # Handle signals for clean shutdown (not supported on all platforms)
+        try:
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
+        except NotImplementedError:
+            pass  # Windows / some event loops don't support signal handlers
 
         await serve_task
 
@@ -228,13 +231,21 @@ class BaseAgent:
                 "cwd": os.getcwd(),
                 "config": os.path.abspath(self.config_path) if self.config_path else "",
             })
-            print(json.dumps(r.json(), indent=2))
+            r.raise_for_status()
+            try:
+                print(json.dumps(r.json(), indent=2))
+            except (json.JSONDecodeError, ValueError):
+                print(r.text)
 
     def _do_uninstall(self) -> None:
         """Synchronous uninstall."""
         with httpx.Client(timeout=10.0) as client:
             r = client.request("DELETE", f"{self.bus_url}/v1/install/{self.agent_id}")
-            print(json.dumps(r.json(), indent=2))
+            r.raise_for_status()
+            try:
+                print(json.dumps(r.json(), indent=2))
+            except (json.JSONDecodeError, ValueError):
+                print(r.text)
 
     # -- registration --
 
@@ -343,7 +354,7 @@ class BaseAgent:
         )
         return r.json()
 
-    async def nack(self, message_id: int, topic: str, reason: str = "") -> dict:
+    async def nack(self, message_id: str, topic: str, reason: str = "") -> dict:
         """Negative-acknowledge a message for redelivery."""
         r = await self._http.post(
             f"{self.bus_url}/v1/nack",
@@ -451,10 +462,15 @@ class BaseAgent:
 
         This is a migration bridge. The end state is native @handler
         methods, not wrapped MCP tools.
+
+        Note: calls ``asyncio.run(mcp_server.list_tools())`` to introspect
+        tools. Must be called outside an existing event loop (not from
+        async code). For async contexts, introspect the server's tools
+        separately and construct the agent manually.
         """
         import asyncio as _aio
 
-        # Introspect MCP tools
+        # Introspect MCP tools (requires no running event loop)
         tools = _aio.run(mcp_server.list_tools())
 
         # Build dynamic subclass
@@ -469,8 +485,9 @@ class BaseAgent:
                 parameters={},  # could extract from tool.inputSchema
             ))
 
-            # Create a handler that calls the MCP tool
-            async def _make_handler(tn):
+            # Create a handler that wraps the MCP tool call.
+            # Use a closure over tool_name to capture the correct value.
+            def _make_handler(tn):
                 async def _handler(self_inner, args):
                     result = await mcp_server.call_tool(tn, args)
                     # MCP tools return [TextContent, ...] — extract text
@@ -485,7 +502,7 @@ class BaseAgent:
                     return {"result": str(result)}
                 return _handler
 
-            handler_fn = _aio.run(_make_handler(tool_name))
+            handler_fn = _make_handler(tool_name)
             setattr(handler_fn, _HANDLER_ATTR, tool_name)
             handlers[tool_name] = handler_fn
 

@@ -36,6 +36,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -122,20 +123,89 @@ class BaseAgent:
         self._http = httpx.AsyncClient(timeout=30.0)
         self._connector: BusConnector | None = None
         self._handlers: dict[str, Callable] = {}
+        self._started_at: float = time.monotonic()
         self._collect_handlers()
 
     def _collect_handlers(self) -> None:
-        """Discover @handler-decorated methods."""
-        for name in dir(self):
-            method = getattr(self, name, None)
-            if callable(method) and hasattr(method, _HANDLER_ATTR):
-                op = getattr(method, _HANDLER_ATTR)
-                self._handlers[op] = method
+        """Discover @handler-decorated methods.
+
+        Walks the MRO from most-base to most-derived so that a subclass
+        handler for the same operation wins, even when its method name
+        differs from the base's (e.g. ``handle_health_check`` overridden
+        by a new ``custom_health`` method on the subclass).
+        """
+        for klass in reversed(type(self).__mro__):
+            for attr_name, attr_value in vars(klass).items():
+                if not callable(attr_value) or not hasattr(attr_value, _HANDLER_ATTR):
+                    continue
+                op = getattr(attr_value, _HANDLER_ATTR)
+                self._handlers[op] = getattr(self, attr_name)
+
+    # -- built-in skills --
+
+    # Tuple (not list) so the class-level descriptors can't be accidentally
+    # mutated; `_all_skills` also returns fresh Skill instances so callers
+    # that mutate the result don't affect future calls.
+    BUILT_IN_SKILLS: tuple[Skill, ...] = (
+        Skill(
+            name="health_check",
+            description="Agent liveness + identity probe. Always available.",
+            parameters={},
+        ),
+    )
+
+    def _all_skills(self) -> list[Skill]:
+        """Compose subclass skills with built-ins.
+
+        Subclass names take precedence — a subclass can replace the
+        built-in schema/description (e.g. to return a richer health
+        payload) without losing the skill advertisement.
+
+        Fresh Skill instances are constructed for built-ins so the
+        class-level descriptors stay pristine across calls.
+        """
+        subclass_skills = self.register_skills()
+        subclass_names = {s.name for s in subclass_skills}
+        extras = [
+            Skill(
+                name=s.name,
+                description=s.description,
+                parameters=dict(s.parameters),
+                since=s.since,
+            )
+            for s in self.BUILT_IN_SKILLS
+            if s.name not in subclass_names
+        ]
+        return subclass_skills + extras
+
+    @handler("health_check")
+    async def handle_health_check(self, args: dict) -> dict:
+        """Default health payload: identity, version, pid, uptime, bus link.
+
+        Subclasses can override (regular Python method override) to add
+        domain-specific checks (stores reachable, model pool ready, etc.)
+        — they should call ``super().handle_health_check(args)`` and merge
+        to keep the baseline fields.
+        """
+        return {
+            "agent_id": self.agent_id,
+            "agent_type": self.agent_type,
+            "version": self.version,
+            "pid": os.getpid(),
+            "uptime_seconds": round(time.monotonic() - self._started_at, 3),
+            "bus_url": self.bus_url,
+            "connected": bool(self._connector and self._connector.connected),
+        }
 
     # -- override these --
 
     def register_skills(self) -> list[Skill]:
-        """Return the skills this agent provides. Override in subclass."""
+        """Return the skills this agent provides. Override in subclass.
+
+        `health_check` is always advertised via :attr:`BUILT_IN_SKILLS`;
+        subclasses do not need to include it. Return it explicitly only
+        if overriding the schema or description.
+        """
         return []
 
     def register_collaborations(self) -> list[Collaboration]:
@@ -175,7 +245,7 @@ class BaseAgent:
         No port binding, no HTTP server. The agent is a pure WebSocket
         client. The bus sends requests over the same connection.
         """
-        skills = self.register_skills()
+        skills = self._all_skills()
         collabs = self.register_collaborations()
 
         self._connector = BusConnector(

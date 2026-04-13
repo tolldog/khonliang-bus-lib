@@ -75,7 +75,8 @@ def test_collaborations_registered(agent):
 # -- handlers --
 
 def test_handlers_collected(agent):
-    assert set(agent._handlers) == {"echo", "upper", "fail"}
+    # EchoAgent declares echo/upper/fail; health_check comes for free from BaseAgent.
+    assert set(agent._handlers) == {"echo", "upper", "fail", "health_check"}
 
 
 @pytest.mark.asyncio
@@ -159,3 +160,88 @@ def test_no_fastapi_dependency(agent):
     """BaseAgent should NOT use FastAPI/uvicorn — pure WebSocket client."""
     assert not hasattr(agent, "_build_app")
     assert agent._connector is None
+
+
+# -- built-in health_check --
+
+class BareAgent(BaseAgent):
+    """Agent that declares no skills of its own."""
+
+    agent_type = "bare"
+    module_name = "tests.test_agent"
+    version = "1.0.0"
+
+
+def test_bare_agent_advertises_health_check():
+    """An agent with no skills of its own still gets health_check."""
+    a = BareAgent(agent_id="bare", bus_url="http://localhost:9999")
+    names = {s.name for s in a._all_skills()}
+    assert names == {"health_check"}
+
+
+def test_subclass_skills_augmented_with_health_check(agent):
+    """Subclass skills + built-in health_check are merged."""
+    names = {s.name for s in agent._all_skills()}
+    assert names == {"echo", "upper", "fail", "health_check"}
+
+
+def test_register_skills_unchanged_by_builtins(agent):
+    """register_skills() itself still returns only what the subclass declared."""
+    assert {s.name for s in agent.register_skills()} == {"echo", "upper", "fail"}
+
+
+@pytest.mark.asyncio
+async def test_health_check_handler_returns_identity(agent):
+    result = await agent._dispatch_request({"operation": "health_check", "args": {}})
+    assert result["agent_id"] == "echo-test"
+    assert result["agent_type"] == "echo"
+    assert result["version"] == "0.2.0"
+    assert result["bus_url"] == "http://localhost:9999"
+    assert result["connected"] is False
+    assert result["uptime_seconds"] >= 0
+    assert isinstance(result["pid"], int)
+
+
+class OverridingAgent(BaseAgent):
+    """Subclass that replaces health_check with a richer payload."""
+
+    agent_type = "overriding"
+    module_name = "tests.test_agent"
+
+    def register_skills(self):
+        return [
+            Skill(
+                name="health_check",
+                description="Custom health payload for overriding agent",
+                parameters={"detail": {"type": "string"}},
+            ),
+        ]
+
+    @handler("health_check")
+    async def custom_health(self, args):
+        base = await BaseAgent.handle_health_check(self, args)
+        return {**base, "custom": True, "detail_requested": args.get("detail", "")}
+
+
+def test_subclass_can_override_health_check_schema():
+    """Subclass-declared health_check replaces the built-in skill descriptor."""
+    a = OverridingAgent(agent_id="ov", bus_url="http://localhost:9999")
+    skills = a._all_skills()
+    names = [s.name for s in skills]
+    # Exactly one health_check — the subclass version, not duplicated
+    assert names.count("health_check") == 1
+    hc = next(s for s in skills if s.name == "health_check")
+    assert "Custom health payload" in hc.description
+    assert "detail" in hc.parameters
+
+
+@pytest.mark.asyncio
+async def test_subclass_can_extend_health_check_via_super():
+    """Subclass handler can call super's payload and add fields."""
+    a = OverridingAgent(agent_id="ov", bus_url="http://localhost:9999")
+    result = await a._dispatch_request(
+        {"operation": "health_check", "args": {"detail": "verbose"}}
+    )
+    assert result["agent_id"] == "ov"
+    assert result["custom"] is True
+    assert result["detail_requested"] == "verbose"

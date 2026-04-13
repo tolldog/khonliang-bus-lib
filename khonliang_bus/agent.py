@@ -123,7 +123,7 @@ class BaseAgent:
         self._http = httpx.AsyncClient(timeout=30.0)
         self._connector: BusConnector | None = None
         self._handlers: dict[str, Callable] = {}
-        self._started_at: float = time.time()
+        self._started_at: float = time.monotonic()
         self._collect_handlers()
 
     def _collect_handlers(self) -> None:
@@ -134,25 +134,25 @@ class BaseAgent:
         differs from the base's (e.g. ``handle_health_check`` overridden
         by a new ``custom_health`` method on the subclass).
         """
-        seen: set[str] = set()
         for klass in reversed(type(self).__mro__):
             for attr_name, attr_value in vars(klass).items():
                 if not callable(attr_value) or not hasattr(attr_value, _HANDLER_ATTR):
                     continue
                 op = getattr(attr_value, _HANDLER_ATTR)
-                bound = getattr(self, attr_name)
-                self._handlers[op] = bound
-                seen.add(op)
+                self._handlers[op] = getattr(self, attr_name)
 
     # -- built-in skills --
 
-    BUILT_IN_SKILLS: list[Skill] = [
+    # Tuple (not list) so the class-level descriptors can't be accidentally
+    # mutated; `_all_skills` also returns fresh Skill instances so callers
+    # that mutate the result don't affect future calls.
+    BUILT_IN_SKILLS: tuple[Skill, ...] = (
         Skill(
             name="health_check",
             description="Agent liveness + identity probe. Always available.",
             parameters={},
         ),
-    ]
+    )
 
     def _all_skills(self) -> list[Skill]:
         """Compose subclass skills with built-ins.
@@ -160,10 +160,22 @@ class BaseAgent:
         Subclass names take precedence — a subclass can replace the
         built-in schema/description (e.g. to return a richer health
         payload) without losing the skill advertisement.
+
+        Fresh Skill instances are constructed for built-ins so the
+        class-level descriptors stay pristine across calls.
         """
         subclass_skills = self.register_skills()
         subclass_names = {s.name for s in subclass_skills}
-        extras = [s for s in self.BUILT_IN_SKILLS if s.name not in subclass_names]
+        extras = [
+            Skill(
+                name=s.name,
+                description=s.description,
+                parameters=dict(s.parameters),
+                since=s.since,
+            )
+            for s in self.BUILT_IN_SKILLS
+            if s.name not in subclass_names
+        ]
         return subclass_skills + extras
 
     @handler("health_check")
@@ -180,9 +192,9 @@ class BaseAgent:
             "agent_type": self.agent_type,
             "version": self.version,
             "pid": os.getpid(),
-            "uptime_seconds": round(time.time() - self._started_at, 3),
+            "uptime_seconds": round(time.monotonic() - self._started_at, 3),
             "bus_url": self.bus_url,
-            "connected": self._connector is not None,
+            "connected": bool(self._connector and self._connector.connected),
         }
 
     # -- override these --

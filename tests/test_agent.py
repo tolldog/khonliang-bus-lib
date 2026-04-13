@@ -219,7 +219,7 @@ class OverridingAgent(BaseAgent):
 
     @handler("health_check")
     async def custom_health(self, args):
-        base = await BaseAgent.handle_health_check(self, args)
+        base = await super().handle_health_check(args)
         return {**base, "custom": True, "detail_requested": args.get("detail", "")}
 
 

@@ -136,6 +136,54 @@ def test_request_is_async(agent):
     assert asyncio.iscoroutinefunction(agent.request)
 
 
+@pytest.mark.asyncio
+async def test_request_sets_http_timeout_from_bus_timeout(agent):
+    captured = {}
+
+    class FakeResponse:
+        def json(self):
+            return {"result": "ok"}
+
+    class FakeHTTP:
+        async def post(self, url, *, json=None, timeout=None):
+            captured["url"] = url
+            captured["json"] = json
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+    agent._http = FakeHTTP()
+
+    result = await agent.request(agent_type="researcher", operation="slow", timeout=90)
+
+    assert result == {"result": "ok"}
+    assert captured["url"] == "http://localhost:9999/v1/request"
+    assert captured["json"]["timeout"] == 90
+    assert captured["timeout"].read == 95.0
+    assert captured["timeout"].connect == 30.0
+    assert captured["timeout"].write == 30.0
+    assert captured["timeout"].pool == 30.0
+
+
+@pytest.mark.asyncio
+async def test_request_buffer_preserves_bus_timeout_payload(agent):
+    class FakeResponse:
+        def json(self):
+            return {"error": "timeout", "trace_id": "t-slow"}
+
+    class FakeHTTP:
+        async def post(self, url, *, json=None, timeout=None):
+            assert json["timeout"] == 1
+            assert timeout.read == 6.0
+            await asyncio.sleep(0.01)
+            return FakeResponse()
+
+    agent._http = FakeHTTP()
+
+    result = await agent.request(agent_type="researcher", operation="slow", timeout=1)
+
+    assert result == {"error": "timeout", "trace_id": "t-slow"}
+
+
 def test_session_context_helpers_exist(agent):
     assert asyncio.iscoroutinefunction(agent.get_session_context)
     assert asyncio.iscoroutinefunction(agent.update_session_context)

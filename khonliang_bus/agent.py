@@ -370,7 +370,18 @@ class BaseAgent:
             payload["agent_id"] = agent_id
         elif agent_type:
             payload["agent_type"] = agent_type
-        r = await self._http.post(f"{self.bus_url}/v1/request", json=payload)
+        read_timeout = max(float(timeout), 0.0) + 5.0
+        http_timeout = httpx.Timeout(
+            connect=30.0,
+            write=30.0,
+            pool=30.0,
+            read=read_timeout,
+        )
+        r = await self._http.post(
+            f"{self.bus_url}/v1/request",
+            json=payload,
+            timeout=http_timeout,
+        )
         return r.json()
 
     # -- gap reporting --

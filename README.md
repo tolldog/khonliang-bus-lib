@@ -8,7 +8,7 @@ or test agent behavior without booting the full bus service.
 
 ## What Belongs Here
 
-- `BaseAgent` for HTTP callback agents.
+- `BaseAgent` for agents that connect to the bus via `BusConnector`.
 - `Skill` and `Collaboration` registration descriptors.
 - `@handler` for mapping agent methods to bus request operations.
 - `BusClient` for low-level bus HTTP/WebSocket operations.
@@ -21,8 +21,9 @@ or test agent behavior without booting the full bus service.
   Those live in `khonliang-bus`.
 - Domain behavior such as researcher paper ingestion or developer FR lifecycle.
   Those live in their app/agent repos.
-- MCP adapter tool generation. The Claude-facing adapter lives in
-  `khonliang-bus`.
+- Bus-side MCP adapter tool generation. The Claude-facing adapter lives in
+  `khonliang-bus`. This library only includes an optional `from_mcp` migration
+  helper for wrapping existing FastMCP tools as bus agent handlers.
 
 ## Typical Consumer
 
@@ -34,12 +35,12 @@ class ExampleAgent(BaseAgent):
     agent_id = "example-primary"
     agent_type = "example"
 
-    def skills(self):
+    def register_skills(self):
         return [
             Skill(
                 name="ping",
                 description="Return a ping response.",
-                input_schema={"type": "object", "properties": {}},
+                parameters={"type": "object", "properties": {}},
             )
         ]
 

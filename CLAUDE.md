@@ -31,7 +31,7 @@ APPS (agents)
 └─ developer          — consumes corpus → specs, milestones, dispatch
 
 INFRASTRUCTURE
-├─ khonliang-bus      — agent orchestration platform (depends on bus-lib)
+├─ khonliang-bus      — agent orchestration platform (uses bus-lib for bundled agents/tests when needed)
 └─ khonliang-scheduler— LLM inference scheduling
 ```
 

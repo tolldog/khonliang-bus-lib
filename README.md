@@ -10,6 +10,8 @@ or test agent behavior without booting the full bus service.
 
 - `BaseAgent` for agents that connect to the bus via `BusConnector`.
 - `Skill` and `Collaboration` registration descriptors.
+- Skill registry contracts for capability ownership, runtime profile, execution
+  shape, and output contracts.
 - `@handler` for mapping agent methods to bus request operations.
 - `BusClient` for low-level bus HTTP/WebSocket operations.
 - `BusConnector` for registration, request handling, and heartbeat plumbing.
@@ -51,6 +53,44 @@ class ExampleAgent(BaseAgent):
 
 The bus service starts or discovers the agent, the agent registers its skills,
 and the bus MCP adapter exposes those skills to Claude.
+
+## Registry Metadata
+
+Agents can keep using the minimal `Skill(name, description, parameters)` form.
+When a skill needs routing metadata, declare the capability contract at the same
+boundary:
+
+```python
+from khonliang_bus import ExecutionProfile, OutputContract, Skill
+
+
+Skill(
+    name="next_work_unit",
+    description="Return the next ready FR bundle.",
+    parameters={"target": {"type": "string"}},
+    capability="fr.bundle.next",
+    output_contract=OutputContract(
+        output_mode="artifact+summary",
+        artifact_kind="work_unit",
+        summary_fields=["frs", "suggested_next_actions"],
+    ),
+    execution_profiles=[
+        ExecutionProfile(
+            profile_id="three-medium-one-large",
+            mode="workflow",
+            runs=[
+                {"tier": "medium", "count": 3, "role": "candidate"},
+                {"tier": "large", "count": 1, "role": "adjudicator"},
+            ],
+            aggregation="rank_merge_adjudicate",
+        )
+    ],
+    runtime_profile={"model_size": "small", "latency": "fast", "cost": "low"},
+)
+```
+
+The registry dataclasses are dependency-free and round-trip through plain
+dictionaries so the bus service can persist them or route by capability later.
 
 ## Development
 

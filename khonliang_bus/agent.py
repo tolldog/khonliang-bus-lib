@@ -43,6 +43,14 @@ from typing import Any, Callable
 import httpx
 
 from khonliang_bus.connector import BusConnector
+from khonliang_bus.registry import (
+    ExecutionProfile,
+    OutputContract,
+    RuntimeProfile,
+    SkillAuthority,
+    SkillDescriptor,
+    SkillStatus,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +68,100 @@ class Skill:
     description: str = ""
     parameters: dict[str, Any] = field(default_factory=dict)
     since: str = ""
+    capability: str = ""
+    input_schema: dict[str, Any] = field(default_factory=dict)
+    output_contract: OutputContract | dict[str, Any] | None = None
+    authority: SkillAuthority | str = SkillAuthority.AUTHORITATIVE
+    status: SkillStatus | str = SkillStatus.ACTIVE
+    aliases: list[str] = field(default_factory=list)
+    execution_profiles: list[ExecutionProfile | dict[str, Any]] = field(default_factory=list)
+    runtime_profile: RuntimeProfile | dict[str, Any] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.parameters = dict(self.parameters)
+        self.input_schema = dict(self.input_schema or self.parameters)
+        if self.output_contract is not None:
+            self.output_contract = (
+                self.output_contract
+                if isinstance(self.output_contract, OutputContract)
+                else OutputContract.from_dict(self.output_contract)
+            )
+        self.authority = SkillAuthority.coerce(self.authority)
+        self.status = SkillStatus.coerce(self.status)
+        self.aliases = list(self.aliases)
+        self.execution_profiles = [
+            profile
+            if isinstance(profile, ExecutionProfile)
+            else ExecutionProfile.from_dict(profile)
+            for profile in self.execution_profiles
+        ]
+        if self.runtime_profile is not None:
+            self.runtime_profile = (
+                self.runtime_profile
+                if isinstance(self.runtime_profile, RuntimeProfile)
+                else RuntimeProfile.from_dict(self.runtime_profile)
+            )
+        self.metadata = dict(self.metadata)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the skill for bus registration.
+
+        The legacy fields stay stable while richer registry fields are included
+        only when the agent declared them.
+        """
+        payload: dict[str, Any] = {
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters,
+            "since": self.since,
+        }
+        optional = {
+            "capability": self.capability,
+            "input_schema": self.input_schema if self.input_schema != self.parameters else {},
+            "output_contract": (
+                self.output_contract.to_dict()
+                if isinstance(self.output_contract, OutputContract)
+                else None
+            ),
+            "authority": self.authority.value,
+            "status": self.status.value,
+            "aliases": self.aliases,
+            "execution_profiles": [
+                profile.to_dict()
+                for profile in self.execution_profiles
+            ],
+            "runtime_profile": (
+                self.runtime_profile.to_dict()
+                if isinstance(self.runtime_profile, RuntimeProfile)
+                else None
+            ),
+            "metadata": self.metadata,
+        }
+        payload.update({
+            key: value
+            for key, value in optional.items()
+            if value not in (None, "", [], {})
+        })
+        return payload
+
+    def descriptor(self, provider_id: str, skill_id: str | None = None) -> SkillDescriptor:
+        """Convert the agent-facing skill into a registry descriptor."""
+        return SkillDescriptor(
+            skill_id=skill_id or f"{provider_id}.{self.name}",
+            provider_id=provider_id,
+            name=self.name,
+            capability=self.capability or self.name,
+            description=self.description,
+            input_schema=self.input_schema,
+            output_contract=self.output_contract or OutputContract(),
+            authority=self.authority,
+            status=self.status,
+            aliases=self.aliases,
+            execution_profiles=self.execution_profiles,
+            runtime_profile=self.runtime_profile or RuntimeProfile(),
+            metadata=self.metadata,
+        )
 
 
 @dataclass
@@ -167,12 +269,7 @@ class BaseAgent:
         subclass_skills = self.register_skills()
         subclass_names = {s.name for s in subclass_skills}
         extras = [
-            Skill(
-                name=s.name,
-                description=s.description,
-                parameters=dict(s.parameters),
-                since=s.since,
-            )
+            Skill(**s.to_dict())
             for s in self.BUILT_IN_SKILLS
             if s.name not in subclass_names
         ]
@@ -261,15 +358,7 @@ class BaseAgent:
                 agent_type=self.agent_type,
                 version=self.version,
                 pid=os.getpid(),
-                skills=[
-                    {
-                        "name": s.name,
-                        "description": s.description,
-                        "parameters": s.parameters,
-                        "since": s.since,
-                    }
-                    for s in skills
-                ],
+                skills=[s.to_dict() for s in skills],
                 collaborations=[
                     {
                         "name": c.name,

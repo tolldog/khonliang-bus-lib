@@ -32,16 +32,62 @@ For testing::
     result = await harness.call("do_thing", {"x": "hello"})
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from khonliang_bus.agent import BaseAgent, Collaboration, Skill, handler
 from khonliang_bus.client import BusClient, Message
+from khonliang_bus.registry import (
+    AggregationMethod,
+    CapabilityRoute,
+    ContextNeed,
+    CostLevel,
+    ExecutionMode,
+    ExecutionProfile,
+    ExecutionRun,
+    LatencyClass,
+    Locality,
+    ModelSize,
+    OutputContract,
+    OutputMode,
+    ProviderDescriptor,
+    ProviderStatus,
+    ProviderType,
+    ReasoningLevel,
+    RegistryValue,
+    RunTier,
+    RuntimeProfile,
+    SkillAuthority,
+    SkillDescriptor,
+    SkillStatus,
+)
 
 __all__ = [
+    "AggregationMethod",
     "BaseAgent",
     "BusClient",
+    "CapabilityRoute",
     "Collaboration",
+    "ContextNeed",
+    "CostLevel",
+    "ExecutionMode",
+    "ExecutionProfile",
+    "ExecutionRun",
+    "LatencyClass",
+    "Locality",
     "Message",
+    "ModelSize",
+    "OutputContract",
+    "OutputMode",
+    "ProviderDescriptor",
+    "ProviderStatus",
+    "ProviderType",
+    "ReasoningLevel",
+    "RegistryValue",
+    "RunTier",
+    "RuntimeProfile",
     "Skill",
+    "SkillAuthority",
+    "SkillDescriptor",
+    "SkillStatus",
     "handler",
 ]

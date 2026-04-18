@@ -1,6 +1,6 @@
 [project]
 name = "khonliang-bus-lib"
-version = "0.2.0"
+version = "0.3.0"
 description = "Agent library for the khonliang-bus platform — BaseAgent, BusClient, testing harness, and MCP adapter"
 requires-python = ">=3.11"
 dependencies = [

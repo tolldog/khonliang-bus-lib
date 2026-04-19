@@ -24,8 +24,9 @@ or test agent behavior without booting the full bus service.
 - Domain behavior such as researcher paper ingestion or developer FR lifecycle.
   Those live in their app/agent repos.
 - Bus-side MCP adapter tool generation. The Claude-facing adapter lives in
-  `khonliang-bus`. This library only includes an optional `from_mcp` migration
-  helper for wrapping existing FastMCP tools as bus agent handlers.
+  `khonliang-bus`. This library includes an optional `from_mcp` migration
+  bridge for wrapping existing FastMCP tools as bus agent handlers while a repo
+  moves onto native `@handler` methods.
 
 ## Typical Consumer
 
@@ -53,6 +54,35 @@ class ExampleAgent(BaseAgent):
 
 The bus service starts or discovers the agent, the agent registers its skills,
 and the bus MCP adapter exposes those skills to Claude.
+
+## Migration Notes
+
+New agent code should expose native `@handler` methods. Use `from_mcp` when an
+existing FastMCP server needs to move onto the bus before its tools can be
+rewritten as native handlers.
+
+## Config And Local State
+
+`BaseAgent.from_cli()` accepts `--id`, `--bus`, and `--config` so app repos can
+launch agents with local runtime state:
+
+```bash
+python -m my_agent --id my-agent-primary --bus http://localhost:8788 --config /absolute/path/to/config.yaml
+```
+
+This library only passes `config_path` through to the agent instance. It does
+not define config schema, read application config, or store local state.
+
+Keep these in the app repo or local environment:
+
+- `config.yaml`
+- `.mcp.json`
+- databases
+- logs
+- model/runtime-specific paths
+
+Shared skill metadata and bus contracts belong here. Application-specific
+settings belong in the application that owns the agent.
 
 ## Registry Metadata
 

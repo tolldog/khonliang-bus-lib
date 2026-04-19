@@ -558,7 +558,7 @@ class BaseAgent:
             )
         await self._connector.report_gap(operation, reason, context)
 
-    # -- legacy FastMCP migration helper --
+    # -- FastMCP migration bridge --
 
     @classmethod
     def from_mcp(
@@ -575,8 +575,8 @@ class BaseAgent:
         subclass with @handler for each tool. The tool functions stay
         identical — only the transport changes from stdio to bus WebSocket.
 
-        This is a legacy migration bridge. New agents should implement native
-        @handler methods directly instead of wrapping MCP tools.
+        This is a migration bridge. New agents should implement native @handler
+        methods directly instead of wrapping MCP tools.
 
         Note: calls ``asyncio.run(mcp_server.list_tools())`` to introspect
         tools. Must be called outside an existing event loop.

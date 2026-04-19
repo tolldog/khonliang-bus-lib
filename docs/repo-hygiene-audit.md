@@ -1,7 +1,7 @@
 # Repo Hygiene Audit
 
 Generated: 1776579546.2963605
-Repo: `/mnt/dev/ttoll/dev/khonliang-bus-lib`
+Repo: `khonliang-bus-lib`
 
 ## Summary
 

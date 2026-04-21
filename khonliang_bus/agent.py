@@ -55,6 +55,70 @@ from khonliang_bus.registry import (
 logger = logging.getLogger(__name__)
 
 
+def _resolve_distribution_version(module_name: str) -> str | None:
+    """Look up the installed-distribution version that owns ``module_name``.
+
+    Used by :class:`BaseAgent` so agents get a real version in the
+    registry without each subclass re-implementing the
+    ``importlib.metadata`` dance. Maps the top-level package (e.g.
+    ``reviewer`` from ``reviewer.agent``) to its distribution name
+    (e.g. ``khonliang-reviewer``) via :func:`packages_distributions`,
+    then reads that distribution's version.
+
+    Returns ``None`` when the package isn't installed as a distribution
+    (in-tree execution, editable installs that skipped metadata, Python
+    without ``importlib.metadata``), so callers can fall back to their
+    own default.
+    """
+    try:
+        from importlib.metadata import (
+            PackageNotFoundError,
+            packages_distributions,
+            version,
+        )
+    except ImportError:
+        return None
+    if not module_name:
+        return None
+    top = module_name.split(".", 1)[0]
+    try:
+        dists = packages_distributions().get(top) or []
+    except Exception:
+        return None
+    for dist_name in dists:
+        try:
+            return version(dist_name)
+        except PackageNotFoundError:
+            continue
+        except Exception:
+            return None
+    return None
+
+
+def _has_explicit_version(agent: "BaseAgent") -> bool:
+    """Return True when the agent's ``version`` was set by the subclass.
+
+    Checks, in order:
+      1. ``self.__dict__`` — subclass assigned ``self.version = ...`` before
+         calling ``super().__init__`` (instance-level override).
+      2. Each class in the MRO from the subclass down to (but not
+         including) ``BaseAgent`` — a subclass or intermediate base
+         declared ``version`` as a class attribute.
+
+    Value equality against ``BaseAgent.version`` is deliberately NOT
+    used: a subclass that pins ``version = "0.0.0"`` on purpose must
+    not be overwritten just because it coincides with the default.
+    """
+    if "version" in agent.__dict__:
+        return True
+    for klass in type(agent).__mro__:
+        if klass is BaseAgent:
+            break
+        if "version" in klass.__dict__:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Skill descriptor
 # ---------------------------------------------------------------------------
@@ -227,6 +291,16 @@ class BaseAgent:
         self._handlers: dict[str, Callable] = {}
         self._started_at: float = time.monotonic()
         self._collect_handlers()
+        # Auto-derive version from the distribution that owns the
+        # subclass's module when the subclass hasn't set one explicitly.
+        # Detect the override by presence in the instance or subclass
+        # MRO rather than by value equality — a subclass that pins
+        # ``version = "0.0.0"`` on purpose must not be overwritten just
+        # because it matches BaseAgent's default sentinel.
+        if not _has_explicit_version(self):
+            resolved = _resolve_distribution_version(type(self).__module__)
+            if resolved is not None:
+                self.version = resolved
 
     def _collect_handlers(self) -> None:
         """Discover @handler-decorated methods.

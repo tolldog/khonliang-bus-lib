@@ -7,6 +7,7 @@ import asyncio
 import pytest
 
 from khonliang_bus import BaseAgent, Skill, Collaboration, handler
+from khonliang_bus import agent as agent_module
 
 
 class EchoAgent(BaseAgent):
@@ -293,3 +294,147 @@ async def test_subclass_can_extend_health_check_via_super():
     assert result["agent_id"] == "ov"
     assert result["custom"] is True
     assert result["detail_requested"] == "verbose"
+
+
+# -- auto-derived version from distribution metadata --
+
+
+class _UnversionedAgent(BaseAgent):
+    """Subclass that declares no ``version`` — should auto-derive."""
+
+    agent_type = "unversioned"
+    module_name = "fake_pkg.agent"
+
+
+def test_unversioned_agent_auto_derives_version(monkeypatch):
+    """When no subclass sets version, resolve from distribution metadata."""
+    monkeypatch.setattr(_UnversionedAgent, "__module__", "fake_pkg.agent")
+
+    def fake_packages_distributions():
+        return {"fake_pkg": ["khonliang-fake"]}
+
+    def fake_version(name):
+        assert name == "khonliang-fake"
+        return "9.9.9"
+
+    import importlib.metadata as md
+
+    monkeypatch.setattr(md, "packages_distributions", fake_packages_distributions)
+    monkeypatch.setattr(md, "version", fake_version)
+
+    a = _UnversionedAgent(agent_id="u", bus_url="http://localhost:9999")
+    assert a.version == "9.9.9"
+
+
+def test_unversioned_agent_falls_back_when_no_distribution(monkeypatch):
+    """Auto-derivation silently falls back to the BaseAgent default."""
+    monkeypatch.setattr(_UnversionedAgent, "__module__", "ghost_pkg.agent")
+
+    import importlib.metadata as md
+
+    monkeypatch.setattr(md, "packages_distributions", lambda: {})
+
+    a = _UnversionedAgent(agent_id="u", bus_url="http://localhost:9999")
+    assert a.version == BaseAgent.version  # "0.0.0"
+
+
+def test_explicit_version_wins_over_autoderive(monkeypatch):
+    """A subclass that sets ``version`` explicitly is never overwritten."""
+
+    class Explicit(BaseAgent):
+        agent_type = "explicit"
+        module_name = "fake_pkg.agent"
+        version = "3.2.1"
+
+    # Even if auto-derivation would return something different, skip it.
+    import importlib.metadata as md
+
+    monkeypatch.setattr(
+        md, "packages_distributions", lambda: {"fake_pkg": ["khonliang-fake"]}
+    )
+    monkeypatch.setattr(md, "version", lambda name: "9.9.9")
+
+    a = Explicit(agent_id="e", bus_url="http://localhost:9999")
+    assert a.version == "3.2.1"
+
+
+def test_resolve_distribution_version_handles_missing_metadata(monkeypatch):
+    """Helper returns None for modules with no installed distribution."""
+    import importlib.metadata as md
+
+    monkeypatch.setattr(md, "packages_distributions", lambda: {})
+    assert agent_module._resolve_distribution_version("nope.mod") is None
+    assert agent_module._resolve_distribution_version("") is None
+
+
+def test_explicit_sentinel_version_is_not_overridden(monkeypatch):
+    """Subclass pinning ``version = "0.0.0"`` on purpose is respected.
+
+    Regression test for the value-equality bug: detection must be based
+    on whether the subclass *declared* ``version``, not whether its
+    value happens to equal ``BaseAgent.version``. Otherwise a legitimate
+    explicit ``"0.0.0"`` pin silently gets upgraded to whatever
+    ``packages_distributions`` happens to return.
+    """
+
+    class PinnedZero(BaseAgent):
+        agent_type = "pinned-zero"
+        module_name = "fake_pkg.agent"
+        version = "0.0.0"
+
+    import importlib.metadata as md
+
+    monkeypatch.setattr(
+        md, "packages_distributions", lambda: {"fake_pkg": ["khonliang-fake"]}
+    )
+    monkeypatch.setattr(md, "version", lambda name: "9.9.9")
+
+    a = PinnedZero(agent_id="p", bus_url="http://localhost:9999")
+    assert a.version == "0.0.0"
+
+
+def test_intermediate_base_class_version_is_respected(monkeypatch):
+    """Version declared on an intermediate base in the MRO wins over auto-derive."""
+
+    class Mid(BaseAgent):
+        agent_type = "mid"
+        module_name = "fake_pkg.agent"
+        version = "5.0.0"
+
+    class Leaf(Mid):
+        # Inherits version from Mid; does not redeclare.
+        agent_type = "leaf"
+
+    import importlib.metadata as md
+
+    monkeypatch.setattr(
+        md, "packages_distributions", lambda: {"fake_pkg": ["khonliang-fake"]}
+    )
+    monkeypatch.setattr(md, "version", lambda name: "9.9.9")
+
+    a = Leaf(agent_id="l", bus_url="http://localhost:9999")
+    assert a.version == "5.0.0"
+
+
+def test_instance_assignment_before_super_is_respected(monkeypatch):
+    """``self.version = ...`` set before super().__init__ is respected."""
+
+    class PreSet(BaseAgent):
+        agent_type = "preset"
+        module_name = "fake_pkg.agent"
+
+        def __init__(self, **kwargs):
+            # Instance-level assignment lands in self.__dict__ before
+            # the base's __init__ runs its auto-derive guard.
+            self.version = "7.7.7"
+            super().__init__(**kwargs)
+
+    import importlib.metadata as md
+
+    monkeypatch.setattr(
+        md, "packages_distributions", lambda: {"fake_pkg": ["khonliang-fake"]}
+    )
+    monkeypatch.setattr(md, "version", lambda name: "9.9.9")
+
+    a = PreSet(agent_id="ps", bus_url="http://localhost:9999")
+    assert a.version == "7.7.7"

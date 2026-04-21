@@ -32,11 +32,11 @@ For testing::
     result = await harness.call("do_thing", {"x": "hello"})
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 from khonliang_bus.agent import BaseAgent, Collaboration, Skill, handler
 from khonliang_bus.client import BusClient, Message
-from khonliang_bus.versioning import resolve_version
+from khonliang_bus.versioning import add_version_flag, resolve_version
 from khonliang_bus.registry import (
     AggregationMethod,
     CapabilityRoute,
@@ -90,6 +90,7 @@ __all__ = [
     "SkillAuthority",
     "SkillDescriptor",
     "SkillStatus",
+    "add_version_flag",
     "handler",
     "resolve_version",
 ]

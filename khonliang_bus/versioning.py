@@ -32,11 +32,15 @@ runtime, so no invalidation path is needed.
 
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+_UNKNOWN_VERSION = "<unknown>"
 
 
 _resolution_cache: dict[str, str | None] = {}
@@ -194,3 +198,40 @@ def _dash_m_module_name() -> str | None:
         return None
     name = getattr(spec, "name", None)
     return name if isinstance(name, str) and name else None
+
+
+def add_version_flag(
+    parser: argparse.ArgumentParser,
+    module_name: str | None = None,
+) -> None:
+    """Wire ``--version`` / ``-V`` onto ``parser`` using :func:`resolve_version`.
+
+    Usage::
+
+        parser = argparse.ArgumentParser(...)
+        add_version_flag(parser)
+        args = parser.parse_args()
+
+    Agent authors call this once per ``main()`` and get the standard
+    ``argparse`` ``--version`` / ``-V`` behavior: prints the resolved
+    version to stdout and exits 0. ``-h`` / ``--help`` lists the flag
+    automatically — no extra plumbing.
+
+    When ``resolve_version`` returns ``None`` (no pyproject, no
+    distribution metadata, no ``__main__`` spec), the flag prints
+    ``<unknown>`` rather than crashing. That keeps ``--version`` from
+    being the thing that breaks in environments where version
+    resolution is a nice-to-have (ad-hoc scripts, in-tree dev shells).
+
+    ``module_name`` defaults to the current ``__main__`` — the common
+    case when the caller is wiring their own ``main()``. Pass an
+    explicit module name to resolve from somewhere else (library
+    self-introspection, test harnesses).
+    """
+    resolved = resolve_version(module_name) or _UNKNOWN_VERSION
+    parser.add_argument(
+        "--version",
+        "-V",
+        action="version",
+        version=f"%(prog)s {resolved}",
+    )

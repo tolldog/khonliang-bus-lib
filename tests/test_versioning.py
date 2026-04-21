@@ -1,7 +1,8 @@
-"""Tests for ``khonliang_bus.versioning`` — resolution chain + cache."""
+"""Tests for ``khonliang_bus.versioning`` — resolution chain + cache + CLI helper."""
 
 from __future__ import annotations
 
+import argparse
 import sys
 import types
 from pathlib import Path
@@ -262,3 +263,122 @@ def test_resolve_version_is_cached(monkeypatch, tmp_path):
     # Explicit cache reset recomputes.
     versioning._reset_cache()
     assert versioning.resolve_version("cachedpkg.agent") == "2.0.0"
+
+
+# ---------------------------------------------------------------------------
+# add_version_flag CLI helper
+# ---------------------------------------------------------------------------
+
+
+def test_add_version_flag_prints_resolved_version(monkeypatch, tmp_path, capsys):
+    """``--version`` prints the pyproject version from an explicit module_name."""
+    agent_path = _make_fake_pkg(
+        tmp_path, package_name="cliflag", pyproject_version="4.2.0"
+    )
+    fake_module = types.SimpleNamespace(__file__=str(agent_path))
+    monkeypatch.setitem(sys.modules, "cliflag.agent", fake_module)
+
+    parser = argparse.ArgumentParser(prog="myprog")
+    versioning.add_version_flag(parser, module_name="cliflag.agent")
+
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(["--version"])
+    assert excinfo.value.code == 0
+
+    out = capsys.readouterr().out
+    assert "myprog 4.2.0" in out
+
+
+def test_add_version_flag_short_form_works(monkeypatch, tmp_path, capsys):
+    """``-V`` works as a shorthand for ``--version``."""
+    agent_path = _make_fake_pkg(
+        tmp_path, package_name="shortflag", pyproject_version="1.1.1"
+    )
+    fake_module = types.SimpleNamespace(__file__=str(agent_path))
+    monkeypatch.setitem(sys.modules, "shortflag.agent", fake_module)
+
+    parser = argparse.ArgumentParser(prog="prog")
+    versioning.add_version_flag(parser, module_name="shortflag.agent")
+
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(["-V"])
+    assert excinfo.value.code == 0
+    assert "prog 1.1.1" in capsys.readouterr().out
+
+
+def test_add_version_flag_prints_unknown_on_resolution_miss(monkeypatch, capsys):
+    """When ``resolve_version`` returns None, the flag prints ``<unknown>``.
+
+    Ad-hoc scripts and in-tree dev shells may have no pyproject / no
+    metadata; the flag must not crash the program over a nice-to-have.
+    """
+    # Module with no __file__ and no metadata → resolution fails.
+    monkeypatch.setitem(
+        sys.modules, "nowhere.mod", types.SimpleNamespace(__file__=None)
+    )
+    import importlib.metadata as md
+
+    monkeypatch.setattr(md, "packages_distributions", lambda: {})
+
+    parser = argparse.ArgumentParser(prog="ghost")
+    versioning.add_version_flag(parser, module_name="nowhere.mod")
+
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(["--version"])
+    assert excinfo.value.code == 0
+    assert "ghost <unknown>" in capsys.readouterr().out
+
+
+def test_add_version_flag_surfaces_in_help(monkeypatch, tmp_path, capsys):
+    """``--help`` lists the ``--version`` flag without extra boilerplate."""
+    agent_path = _make_fake_pkg(
+        tmp_path, package_name="helpflag", pyproject_version="0.1.0"
+    )
+    fake_module = types.SimpleNamespace(__file__=str(agent_path))
+    monkeypatch.setitem(sys.modules, "helpflag.agent", fake_module)
+
+    parser = argparse.ArgumentParser(prog="helper")
+    versioning.add_version_flag(parser, module_name="helpflag.agent")
+
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(["--help"])
+    assert excinfo.value.code == 0
+    out = capsys.readouterr().out
+    assert "--version" in out
+    assert "-V" in out
+
+
+def test_add_version_flag_defers_resolution_until_invoked(monkeypatch):
+    """Wiring + ``--help`` + non-version args must not call ``resolve_version``.
+
+    Cost-sensitivity regression: argparse's built-in ``action='version'``
+    stores a pre-formatted string at ``add_argument`` time, which would
+    force every startup to pay pyproject-walk cost. Our custom
+    ``_LazyVersionAction`` must not resolve until the flag actually fires.
+    """
+    calls = []
+
+    real_resolve = versioning.resolve_version
+
+    def spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(versioning, "resolve_version", spy)
+
+    parser = argparse.ArgumentParser(prog="lazy")
+    versioning.add_version_flag(parser, module_name="lazy.agent")
+
+    # Wiring alone: no call.
+    assert calls == []
+
+    # Parsing unrelated args: no call.
+    parser.add_argument("--other", default="x")
+    parser.parse_args(["--other", "foo"])
+    assert calls == []
+
+    # Only --version forces resolution.
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--version"])
+    assert len(calls) == 1
+    assert calls[0][0] == ("lazy.agent",)

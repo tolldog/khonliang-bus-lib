@@ -365,3 +365,76 @@ def test_resolve_distribution_version_handles_missing_metadata(monkeypatch):
     monkeypatch.setattr(md, "packages_distributions", lambda: {})
     assert agent_module._resolve_distribution_version("nope.mod") is None
     assert agent_module._resolve_distribution_version("") is None
+
+
+def test_explicit_sentinel_version_is_not_overridden(monkeypatch):
+    """Subclass pinning ``version = "0.0.0"`` on purpose is respected.
+
+    Regression test for the value-equality bug: detection must be based
+    on whether the subclass *declared* ``version``, not whether its
+    value happens to equal ``BaseAgent.version``. Otherwise a legitimate
+    explicit ``"0.0.0"`` pin silently gets upgraded to whatever
+    ``packages_distributions`` happens to return.
+    """
+
+    class PinnedZero(BaseAgent):
+        agent_type = "pinned-zero"
+        module_name = "fake_pkg.agent"
+        version = "0.0.0"
+
+    import importlib.metadata as md
+
+    monkeypatch.setattr(
+        md, "packages_distributions", lambda: {"fake_pkg": ["khonliang-fake"]}
+    )
+    monkeypatch.setattr(md, "version", lambda name: "9.9.9")
+
+    a = PinnedZero(agent_id="p", bus_url="http://localhost:9999")
+    assert a.version == "0.0.0"
+
+
+def test_intermediate_base_class_version_is_respected(monkeypatch):
+    """Version declared on an intermediate base in the MRO wins over auto-derive."""
+
+    class Mid(BaseAgent):
+        agent_type = "mid"
+        module_name = "fake_pkg.agent"
+        version = "5.0.0"
+
+    class Leaf(Mid):
+        # Inherits version from Mid; does not redeclare.
+        agent_type = "leaf"
+
+    import importlib.metadata as md
+
+    monkeypatch.setattr(
+        md, "packages_distributions", lambda: {"fake_pkg": ["khonliang-fake"]}
+    )
+    monkeypatch.setattr(md, "version", lambda name: "9.9.9")
+
+    a = Leaf(agent_id="l", bus_url="http://localhost:9999")
+    assert a.version == "5.0.0"
+
+
+def test_instance_assignment_before_super_is_respected(monkeypatch):
+    """``self.version = ...`` set before super().__init__ is respected."""
+
+    class PreSet(BaseAgent):
+        agent_type = "preset"
+        module_name = "fake_pkg.agent"
+
+        def __init__(self, **kwargs):
+            # Instance-level assignment lands in self.__dict__ before
+            # the base's __init__ runs its auto-derive guard.
+            self.version = "7.7.7"
+            super().__init__(**kwargs)
+
+    import importlib.metadata as md
+
+    monkeypatch.setattr(
+        md, "packages_distributions", lambda: {"fake_pkg": ["khonliang-fake"]}
+    )
+    monkeypatch.setattr(md, "version", lambda name: "9.9.9")
+
+    a = PreSet(agent_id="ps", bus_url="http://localhost:9999")
+    assert a.version == "7.7.7"

@@ -95,6 +95,30 @@ def _resolve_distribution_version(module_name: str) -> str | None:
     return None
 
 
+def _has_explicit_version(agent: "BaseAgent") -> bool:
+    """Return True when the agent's ``version`` was set by the subclass.
+
+    Checks, in order:
+      1. ``self.__dict__`` — subclass assigned ``self.version = ...`` before
+         calling ``super().__init__`` (instance-level override).
+      2. Each class in the MRO from the subclass down to (but not
+         including) ``BaseAgent`` — a subclass or intermediate base
+         declared ``version`` as a class attribute.
+
+    Value equality against ``BaseAgent.version`` is deliberately NOT
+    used: a subclass that pins ``version = "0.0.0"`` on purpose must
+    not be overwritten just because it coincides with the default.
+    """
+    if "version" in agent.__dict__:
+        return True
+    for klass in type(agent).__mro__:
+        if klass is BaseAgent:
+            break
+        if "version" in klass.__dict__:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Skill descriptor
 # ---------------------------------------------------------------------------
@@ -269,9 +293,11 @@ class BaseAgent:
         self._collect_handlers()
         # Auto-derive version from the distribution that owns the
         # subclass's module when the subclass hasn't set one explicitly.
-        # A subclass that overrides ``version`` (class attribute or in
-        # its own __init__ *before* super().__init__) wins unchanged.
-        if self.version == BaseAgent.version:
+        # Detect the override by presence in the instance or subclass
+        # MRO rather than by value equality — a subclass that pins
+        # ``version = "0.0.0"`` on purpose must not be overwritten just
+        # because it matches BaseAgent's default sentinel.
+        if not _has_explicit_version(self):
             resolved = _resolve_distribution_version(type(self).__module__)
             if resolved is not None:
                 self.version = resolved

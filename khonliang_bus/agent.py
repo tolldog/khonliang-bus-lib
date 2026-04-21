@@ -55,6 +55,46 @@ from khonliang_bus.registry import (
 logger = logging.getLogger(__name__)
 
 
+def _resolve_distribution_version(module_name: str) -> str | None:
+    """Look up the installed-distribution version that owns ``module_name``.
+
+    Used by :class:`BaseAgent` so agents get a real version in the
+    registry without each subclass re-implementing the
+    ``importlib.metadata`` dance. Maps the top-level package (e.g.
+    ``reviewer`` from ``reviewer.agent``) to its distribution name
+    (e.g. ``khonliang-reviewer``) via :func:`packages_distributions`,
+    then reads that distribution's version.
+
+    Returns ``None`` when the package isn't installed as a distribution
+    (in-tree execution, editable installs that skipped metadata, Python
+    without ``importlib.metadata``), so callers can fall back to their
+    own default.
+    """
+    try:
+        from importlib.metadata import (
+            PackageNotFoundError,
+            packages_distributions,
+            version,
+        )
+    except ImportError:
+        return None
+    if not module_name:
+        return None
+    top = module_name.split(".", 1)[0]
+    try:
+        dists = packages_distributions().get(top) or []
+    except Exception:
+        return None
+    for dist_name in dists:
+        try:
+            return version(dist_name)
+        except PackageNotFoundError:
+            continue
+        except Exception:
+            return None
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Skill descriptor
 # ---------------------------------------------------------------------------
@@ -227,6 +267,14 @@ class BaseAgent:
         self._handlers: dict[str, Callable] = {}
         self._started_at: float = time.monotonic()
         self._collect_handlers()
+        # Auto-derive version from the distribution that owns the
+        # subclass's module when the subclass hasn't set one explicitly.
+        # A subclass that overrides ``version`` (class attribute or in
+        # its own __init__ *before* super().__init__) wins unchanged.
+        if self.version == BaseAgent.version:
+            resolved = _resolve_distribution_version(type(self).__module__)
+            if resolved is not None:
+                self.version = resolved
 
     def _collect_handlers(self) -> None:
         """Discover @handler-decorated methods.

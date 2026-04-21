@@ -7,6 +7,7 @@ import asyncio
 import pytest
 
 from khonliang_bus import BaseAgent, Skill, Collaboration, handler
+from khonliang_bus import agent as agent_module
 
 
 class EchoAgent(BaseAgent):
@@ -293,3 +294,74 @@ async def test_subclass_can_extend_health_check_via_super():
     assert result["agent_id"] == "ov"
     assert result["custom"] is True
     assert result["detail_requested"] == "verbose"
+
+
+# -- auto-derived version from distribution metadata --
+
+
+class _UnversionedAgent(BaseAgent):
+    """Subclass that declares no ``version`` — should auto-derive."""
+
+    agent_type = "unversioned"
+    module_name = "fake_pkg.agent"
+
+
+def test_unversioned_agent_auto_derives_version(monkeypatch):
+    """When no subclass sets version, resolve from distribution metadata."""
+    monkeypatch.setattr(_UnversionedAgent, "__module__", "fake_pkg.agent")
+
+    def fake_packages_distributions():
+        return {"fake_pkg": ["khonliang-fake"]}
+
+    def fake_version(name):
+        assert name == "khonliang-fake"
+        return "9.9.9"
+
+    import importlib.metadata as md
+
+    monkeypatch.setattr(md, "packages_distributions", fake_packages_distributions)
+    monkeypatch.setattr(md, "version", fake_version)
+
+    a = _UnversionedAgent(agent_id="u", bus_url="http://localhost:9999")
+    assert a.version == "9.9.9"
+
+
+def test_unversioned_agent_falls_back_when_no_distribution(monkeypatch):
+    """Auto-derivation silently falls back to the BaseAgent default."""
+    monkeypatch.setattr(_UnversionedAgent, "__module__", "ghost_pkg.agent")
+
+    import importlib.metadata as md
+
+    monkeypatch.setattr(md, "packages_distributions", lambda: {})
+
+    a = _UnversionedAgent(agent_id="u", bus_url="http://localhost:9999")
+    assert a.version == BaseAgent.version  # "0.0.0"
+
+
+def test_explicit_version_wins_over_autoderive(monkeypatch):
+    """A subclass that sets ``version`` explicitly is never overwritten."""
+
+    class Explicit(BaseAgent):
+        agent_type = "explicit"
+        module_name = "fake_pkg.agent"
+        version = "3.2.1"
+
+    # Even if auto-derivation would return something different, skip it.
+    import importlib.metadata as md
+
+    monkeypatch.setattr(
+        md, "packages_distributions", lambda: {"fake_pkg": ["khonliang-fake"]}
+    )
+    monkeypatch.setattr(md, "version", lambda name: "9.9.9")
+
+    a = Explicit(agent_id="e", bus_url="http://localhost:9999")
+    assert a.version == "3.2.1"
+
+
+def test_resolve_distribution_version_handles_missing_metadata(monkeypatch):
+    """Helper returns None for modules with no installed distribution."""
+    import importlib.metadata as md
+
+    monkeypatch.setattr(md, "packages_distributions", lambda: {})
+    assert agent_module._resolve_distribution_version("nope.mod") is None
+    assert agent_module._resolve_distribution_version("") is None

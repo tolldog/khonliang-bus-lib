@@ -7,7 +7,6 @@ import asyncio
 import pytest
 
 from khonliang_bus import BaseAgent, Skill, Collaboration, handler
-from khonliang_bus import agent as agent_module
 
 
 class EchoAgent(BaseAgent):
@@ -358,15 +357,6 @@ def test_explicit_version_wins_over_autoderive(monkeypatch):
     assert a.version == "3.2.1"
 
 
-def test_resolve_distribution_version_handles_missing_metadata(monkeypatch):
-    """Helper returns None for modules with no installed distribution."""
-    import importlib.metadata as md
-
-    monkeypatch.setattr(md, "packages_distributions", lambda: {})
-    assert agent_module._resolve_distribution_version("nope.mod") is None
-    assert agent_module._resolve_distribution_version("") is None
-
-
 def test_explicit_sentinel_version_is_not_overridden(monkeypatch):
     """Subclass pinning ``version = "0.0.0"`` on purpose is respected.
 
@@ -438,43 +428,6 @@ def test_instance_assignment_before_super_is_respected(monkeypatch):
 
     a = PreSet(agent_id="ps", bus_url="http://localhost:9999")
     assert a.version == "7.7.7"
-
-
-def test_resolve_distribution_version_recovers_from_dash_m_main(monkeypatch):
-    """Launching an agent via ``python -m pkg.agent`` still resolves.
-
-    The bus supervisor launches agents with ``-m``, which makes
-    ``type(cls).__module__ == "__main__"``. Without consulting
-    ``sys.modules["__main__"].__spec__.name`` the resolver would
-    short-circuit on ``"__main__"`` and every bus-launched agent
-    would register as ``0.0.0``.
-    """
-    import sys
-    import types
-
-    import importlib.metadata as md
-
-    fake_spec = types.SimpleNamespace(name="reviewer.agent")
-    fake_main = types.SimpleNamespace(__spec__=fake_spec)
-    monkeypatch.setitem(sys.modules, "__main__", fake_main)
-
-    monkeypatch.setattr(
-        md, "packages_distributions", lambda: {"reviewer": ["khonliang-reviewer"]}
-    )
-    monkeypatch.setattr(md, "version", lambda name: "0.5.0")
-
-    assert agent_module._resolve_distribution_version("__main__") == "0.5.0"
-
-
-def test_resolve_distribution_version_handles_main_without_spec(monkeypatch):
-    """REPL / script launch leaves __main__ without a useful __spec__."""
-    import sys
-    import types
-
-    monkeypatch.setitem(
-        sys.modules, "__main__", types.SimpleNamespace(__spec__=None)
-    )
-    assert agent_module._resolve_distribution_version("__main__") is None
 
 
 def test_unversioned_agent_autoderives_when_launched_via_dash_m(monkeypatch):

@@ -165,6 +165,37 @@ def test_pyproject_walk_falls_back_to_metadata_when_absent(monkeypatch, tmp_path
     assert versioning.resolve_version("straypkg.agent") == "8.8.8"
 
 
+def test_pyproject_above_non_git_rooted_module_is_ignored(monkeypatch, tmp_path):
+    """Module outside a git root must not match an ancestor pyproject.
+
+    Without a ``.git/`` anchor above the module, the walk must refuse
+    to pick up whatever pyproject happens to exist further up the tree
+    — e.g., a stray ``$HOME/pyproject.toml`` or a parent-repo config.
+    The caller falls through to ``importlib.metadata`` instead.
+    """
+    # Ancestor has a pyproject but NO .git/ anywhere on the path to the module.
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "ancestor"\nversion = "6.6.6"\n'
+    )
+    nested = tmp_path / "sub" / "deeper"
+    nested.mkdir(parents=True)
+    agent = nested / "agent.py"
+    agent.write_text("")
+
+    fake_module = types.SimpleNamespace(__file__=str(agent))
+    monkeypatch.setitem(sys.modules, "uncontrolled.agent", fake_module)
+
+    import importlib.metadata as md
+
+    monkeypatch.setattr(
+        md, "packages_distributions", lambda: {"uncontrolled": ["khonliang-unctl"]}
+    )
+    monkeypatch.setattr(md, "version", lambda name: "1.2.3")
+
+    # Must fall through to metadata, NOT report "6.6.6" from the ancestor.
+    assert versioning.resolve_version("uncontrolled.agent") == "1.2.3"
+
+
 def test_malformed_pyproject_returns_none(monkeypatch, tmp_path):
     """Syntax-broken pyproject doesn't crash — resolver returns None."""
     repo = tmp_path / "repo"

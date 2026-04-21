@@ -23,10 +23,11 @@ Resolution chain (first non-None wins):
    distribution name, then read :func:`~importlib.metadata.version`.
 4. **None** when nothing above succeeds.
 
-Caching is per-class for the process lifetime. Once ``resolve_version``
-answers for a given ``module_name``, subsequent calls return the same
-value; module names and pyproject locations do not change at runtime,
-so no invalidation path is needed.
+Caching is per resolved ``module_name`` key for the process lifetime.
+Once ``resolve_version`` answers for a given key (with explicit
+``None`` normalized to ``"__main__"``), subsequent calls return the
+same value; module names and pyproject locations do not change at
+runtime, so no invalidation path is needed.
 """
 
 from __future__ import annotations
@@ -52,9 +53,11 @@ def _reset_cache() -> None:
 def resolve_version(module_name: str | None = None) -> str | None:
     """Return the version string that owns ``module_name``.
 
-    ``module_name`` defaults to the caller's ``__name__`` — agents pass
-    ``type(self).__module__`` at construction time. When ``None`` is
-    passed explicitly, resolve from the current ``__main__`` spec.
+    Callers should usually pass an explicit module name such as
+    ``type(self).__module__`` at construction time. When
+    ``module_name`` is omitted or ``None``, the lookup resolves from
+    the current ``__main__`` spec (the ``python -m`` recovery path).
+    There is no implicit call-stack introspection.
 
     Returns ``None`` when nothing in the resolution chain can identify a
     version — callers decide whether to surface the miss or fall back to
@@ -89,16 +92,19 @@ def _resolve_uncached(module_name: str) -> str | None:
 def _resolve_from_pyproject(module_name: str) -> str | None:
     """Walk up from the module's source file looking for ``pyproject.toml``.
 
-    Terminates at the first ancestor directory containing ``.git/`` so
-    the search cannot escape the repo root — without the sentinel, a
-    deeply-nested editable install could match a sibling repo's or the
-    home directory's ``pyproject.toml`` and silently report the wrong
-    version.
+    The search is anchored to a git root: we first locate the nearest
+    ancestor directory containing ``.git/``, then only accept a
+    ``pyproject.toml`` found *within that subtree* (between the module
+    file and the git root, inclusive). If no ``.git/`` is found, the
+    search returns ``None`` immediately — this prevents site-packages
+    code from matching unrelated parent pyprojects (e.g. a stray
+    ``$HOME/pyproject.toml``) and silently reporting the wrong version,
+    letting the caller fall through to ``importlib.metadata`` instead.
 
-    Returns ``None`` when the module has no resolvable source file, when
-    no ``pyproject.toml`` is found before hitting ``.git/`` or the
-    filesystem root, or when the found file is unreadable / lacks a
-    ``project.version`` key.
+    Returns ``None`` when the module has no resolvable source file, is
+    not inside a git-tracked directory, finds no ``pyproject.toml``
+    inside that git subtree, or when the found file is unreadable /
+    lacks a ``project.version`` key.
     """
     try:
         import tomllib
@@ -115,6 +121,13 @@ def _resolve_from_pyproject(module_name: str) -> str | None:
     if not source_file:
         return None
     start = Path(source_file).resolve().parent
+    repo_root: Path | None = None
+    for directory in [start, *start.parents]:
+        if (directory / ".git").exists():
+            repo_root = directory
+            break
+    if repo_root is None:
+        return None
     for directory in [start, *start.parents]:
         candidate = directory / "pyproject.toml"
         if candidate.is_file():
@@ -128,8 +141,8 @@ def _resolve_from_pyproject(module_name: str) -> str | None:
             if isinstance(version, str) and version:
                 return version
             return None
-        if (directory / ".git").exists():
-            return None
+        if directory == repo_root:
+            break
     return None
 
 

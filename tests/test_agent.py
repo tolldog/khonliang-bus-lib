@@ -438,3 +438,66 @@ def test_instance_assignment_before_super_is_respected(monkeypatch):
 
     a = PreSet(agent_id="ps", bus_url="http://localhost:9999")
     assert a.version == "7.7.7"
+
+
+def test_resolve_distribution_version_recovers_from_dash_m_main(monkeypatch):
+    """Launching an agent via ``python -m pkg.agent`` still resolves.
+
+    The bus supervisor launches agents with ``-m``, which makes
+    ``type(cls).__module__ == "__main__"``. Without consulting
+    ``sys.modules["__main__"].__spec__.name`` the resolver would
+    short-circuit on ``"__main__"`` and every bus-launched agent
+    would register as ``0.0.0``.
+    """
+    import sys
+    import types
+
+    import importlib.metadata as md
+
+    fake_spec = types.SimpleNamespace(name="reviewer.agent")
+    fake_main = types.SimpleNamespace(__spec__=fake_spec)
+    monkeypatch.setitem(sys.modules, "__main__", fake_main)
+
+    monkeypatch.setattr(
+        md, "packages_distributions", lambda: {"reviewer": ["khonliang-reviewer"]}
+    )
+    monkeypatch.setattr(md, "version", lambda name: "0.5.0")
+
+    assert agent_module._resolve_distribution_version("__main__") == "0.5.0"
+
+
+def test_resolve_distribution_version_handles_main_without_spec(monkeypatch):
+    """REPL / script launch leaves __main__ without a useful __spec__."""
+    import sys
+    import types
+
+    monkeypatch.setitem(
+        sys.modules, "__main__", types.SimpleNamespace(__spec__=None)
+    )
+    assert agent_module._resolve_distribution_version("__main__") is None
+
+
+def test_unversioned_agent_autoderives_when_launched_via_dash_m(monkeypatch):
+    """End-to-end: a subclass whose __module__ is "__main__" still resolves."""
+    import sys
+    import types
+
+    class DashMAgent(BaseAgent):
+        agent_type = "dash-m"
+        module_name = "fake_pkg.agent"
+
+    monkeypatch.setattr(DashMAgent, "__module__", "__main__")
+
+    fake_spec = types.SimpleNamespace(name="fake_pkg.agent")
+    fake_main = types.SimpleNamespace(__spec__=fake_spec)
+    monkeypatch.setitem(sys.modules, "__main__", fake_main)
+
+    import importlib.metadata as md
+
+    monkeypatch.setattr(
+        md, "packages_distributions", lambda: {"fake_pkg": ["khonliang-fake"]}
+    )
+    monkeypatch.setattr(md, "version", lambda name: "4.5.6")
+
+    a = DashMAgent(agent_id="d", bus_url="http://localhost:9999")
+    assert a.version == "4.5.6"

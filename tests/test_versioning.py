@@ -346,3 +346,39 @@ def test_add_version_flag_surfaces_in_help(monkeypatch, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "--version" in out
     assert "-V" in out
+
+
+def test_add_version_flag_defers_resolution_until_invoked(monkeypatch):
+    """Wiring + ``--help`` + non-version args must not call ``resolve_version``.
+
+    Cost-sensitivity regression: argparse's built-in ``action='version'``
+    stores a pre-formatted string at ``add_argument`` time, which would
+    force every startup to pay pyproject-walk cost. Our custom
+    ``_LazyVersionAction`` must not resolve until the flag actually fires.
+    """
+    calls = []
+
+    real_resolve = versioning.resolve_version
+
+    def spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(versioning, "resolve_version", spy)
+
+    parser = argparse.ArgumentParser(prog="lazy")
+    versioning.add_version_flag(parser, module_name="lazy.agent")
+
+    # Wiring alone: no call.
+    assert calls == []
+
+    # Parsing unrelated args: no call.
+    parser.add_argument("--other", default="x")
+    parser.parse_args(["--other", "foo"])
+    assert calls == []
+
+    # Only --version forces resolution.
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--version"])
+    assert len(calls) == 1
+    assert calls[0][0] == ("lazy.agent",)

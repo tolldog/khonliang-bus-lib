@@ -200,6 +200,44 @@ def _dash_m_module_name() -> str | None:
     return name if isinstance(name, str) and name else None
 
 
+class _LazyVersionAction(argparse.Action):
+    """``--version`` action that defers resolution until the flag fires.
+
+    The stdlib ``action='version'`` stores a formatted string at
+    ``add_argument`` time, which would force every startup to pay the
+    pyproject-walk cost — even runs that never pass ``--version`` and
+    even ``--help`` invocations. Deferring to call-time means normal
+    agent boot paths don't touch the filesystem or metadata at all,
+    and the cost shows up exactly when someone asks for the version.
+    """
+
+    def __init__(
+        self,
+        option_strings: list[str],
+        dest: str,
+        module_name: str | None = None,
+        help: str = "show program version and exit",  # noqa: A002 — argparse convention
+        **kwargs: object,
+    ):
+        kwargs.setdefault("nargs", 0)
+        kwargs.setdefault("default", argparse.SUPPRESS)
+        super().__init__(option_strings, dest, help=help, **kwargs)
+        self._module_name = module_name
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: object,
+        option_string: str | None = None,
+    ) -> None:
+        resolved = resolve_version(self._module_name) or _UNKNOWN_VERSION
+        # Match the stdlib ``action='version'`` convention: version info goes
+        # to stdout (not stderr), followed by a clean exit 0.
+        print(f"{parser.prog} {resolved}")
+        parser.exit(0)
+
+
 def add_version_flag(
     parser: argparse.ArgumentParser,
     module_name: str | None = None,
@@ -217,6 +255,10 @@ def add_version_flag(
     version to stdout and exits 0. ``-h`` / ``--help`` lists the flag
     automatically — no extra plumbing.
 
+    Version resolution is **deferred** to the moment ``--version`` is
+    actually invoked. Wiring the flag is free; normal startup paths
+    (including ``--help``) don't walk the filesystem or read metadata.
+
     When ``resolve_version`` returns ``None`` (no pyproject, no
     distribution metadata, no ``__main__`` spec), the flag prints
     ``<unknown>`` rather than crashing. That keeps ``--version`` from
@@ -228,10 +270,9 @@ def add_version_flag(
     explicit module name to resolve from somewhere else (library
     self-introspection, test harnesses).
     """
-    resolved = resolve_version(module_name) or _UNKNOWN_VERSION
     parser.add_argument(
         "--version",
         "-V",
-        action="version",
-        version=f"%(prog)s {resolved}",
+        action=_LazyVersionAction,
+        module_name=module_name,
     )

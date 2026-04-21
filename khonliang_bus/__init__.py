@@ -36,6 +36,7 @@ __version__ = "0.3.0"
 
 from khonliang_bus.agent import BaseAgent, Collaboration, Skill, handler
 from khonliang_bus.client import BusClient, Message
+from khonliang_bus.versioning import resolve_version
 from khonliang_bus.registry import (
     AggregationMethod,
     CapabilityRoute,
@@ -90,4 +91,5 @@ __all__ = [
     "SkillDescriptor",
     "SkillStatus",
     "handler",
+    "resolve_version",
 ]

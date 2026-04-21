@@ -51,82 +51,9 @@ from khonliang_bus.registry import (
     SkillDescriptor,
     SkillStatus,
 )
+from khonliang_bus.versioning import resolve_version
 
 logger = logging.getLogger(__name__)
-
-
-def _resolve_distribution_version(module_name: str) -> str | None:
-    """Look up the installed-distribution version that owns ``module_name``.
-
-    Used by :class:`BaseAgent` so agents get a real version in the
-    registry without each subclass re-implementing the
-    ``importlib.metadata`` dance. Maps the top-level package (e.g.
-    ``reviewer`` from ``reviewer.agent``) to its distribution name
-    (e.g. ``khonliang-reviewer``) via :func:`packages_distributions`,
-    then reads that distribution's version.
-
-    Handles the ``python -m pkg.module`` launch path specially: when
-    Python runs a module as ``__main__``, ``type(cls).__module__``
-    becomes the literal string ``"__main__"`` rather than the dotted
-    path the user typed. The real dotted name is preserved on
-    ``sys.modules["__main__"].__spec__.name``, so we consult that when
-    the caller's module is ``"__main__"``. Without this, agents
-    launched via ``python -m reviewer.agent`` (the bus supervisor's
-    launch pattern) would always fall back to BaseAgent's default.
-
-    Returns ``None`` when the package isn't installed as a distribution
-    (in-tree execution, editable installs that skipped metadata, Python
-    without ``importlib.metadata``), so callers can fall back to their
-    own default.
-    """
-    try:
-        from importlib.metadata import (
-            PackageNotFoundError,
-            packages_distributions,
-            version,
-        )
-    except ImportError:
-        return None
-    if not module_name:
-        return None
-    if module_name == "__main__":
-        module_name = _dash_m_module_name() or module_name
-        if module_name == "__main__":
-            return None
-    top = module_name.split(".", 1)[0]
-    if top == "__main__":
-        return None
-    try:
-        dists = packages_distributions().get(top) or []
-    except Exception:
-        return None
-    for dist_name in dists:
-        try:
-            return version(dist_name)
-        except PackageNotFoundError:
-            continue
-        except Exception:
-            return None
-    return None
-
-
-def _dash_m_module_name() -> str | None:
-    """Recover the dotted name passed to ``python -m <name>``.
-
-    When Python runs a module via ``-m``, the module is registered in
-    ``sys.modules`` under both its original dotted name *and*
-    ``"__main__"``. The original name lives on
-    ``sys.modules["__main__"].__spec__.name``. Returns ``None`` when
-    the ``__main__`` module has no spec (e.g. script launch, REPL).
-    """
-    main_mod = sys.modules.get("__main__")
-    if main_mod is None:
-        return None
-    spec = getattr(main_mod, "__spec__", None)
-    if spec is None:
-        return None
-    name = getattr(spec, "name", None)
-    return name if isinstance(name, str) and name else None
 
 
 def _has_explicit_version(agent: "BaseAgent") -> bool:
@@ -332,7 +259,7 @@ class BaseAgent:
         # ``version = "0.0.0"`` on purpose must not be overwritten just
         # because it matches BaseAgent's default sentinel.
         if not _has_explicit_version(self):
-            resolved = _resolve_distribution_version(type(self).__module__)
+            resolved = resolve_version(type(self).__module__)
             if resolved is not None:
                 self.version = resolved
 

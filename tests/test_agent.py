@@ -454,3 +454,110 @@ def test_unversioned_agent_autoderives_when_launched_via_dash_m(monkeypatch):
 
     a = DashMAgent(agent_id="d", bus_url="http://localhost:9999")
     assert a.version == "4.5.6"
+
+
+# -- Skill.default_timeout_s (fr_khonliang_1d7b5dd3) --
+
+
+def test_skill_default_timeout_s_defaults_to_none():
+    """Backwards-compat: existing callers don't have to opt in."""
+    s = Skill("echo", "Echo the input")
+    assert s.default_timeout_s is None
+
+
+def test_skill_positional_args_preserve_metadata_slot():
+    """Back-compat: appending ``default_timeout_s`` at the END of the
+    dataclass field list must not shift the positional-arg slot of
+    ``metadata`` (or any pre-existing field). A caller that passed
+    ``metadata`` positionally before this field landed must still hit
+    ``metadata`` — not ``default_timeout_s`` — after.
+
+    Positional order for Skill is: name, description, parameters, since,
+    capability, input_schema, output_contract, authority, status, aliases,
+    execution_profiles, runtime_profile, metadata, default_timeout_s.
+    """
+    s = Skill(
+        "name",
+        "desc",
+        {"handler": "schema"},
+        "0.1.0",
+        "cap",
+        {"handler": "schema"},
+        None,
+        "authoritative",
+        "active",
+        [],
+        [],
+        None,
+        {"foo": "bar"},
+    )
+    assert s.metadata == {"foo": "bar"}
+    assert s.default_timeout_s is None
+
+
+def test_skill_default_timeout_s_accepts_positive_float():
+    s = Skill("review_pr", "Slow skill", default_timeout_s=120.0)
+    assert s.default_timeout_s == 120.0
+    assert isinstance(s.default_timeout_s, float)
+
+
+def test_skill_default_timeout_s_coerces_int_to_float():
+    """Ints are accepted and stored as floats for ladder-consumer simplicity."""
+    s = Skill("review_pr", default_timeout_s=120)
+    assert s.default_timeout_s == 120.0
+    assert isinstance(s.default_timeout_s, float)
+
+
+def test_skill_default_timeout_s_round_trips_through_to_dict():
+    s = Skill("review_pr", "Slow skill", default_timeout_s=120.0)
+    payload = s.to_dict()
+    assert payload["default_timeout_s"] == 120.0
+    # Reconstruct from the serialized payload — mirrors the
+    # ``Skill(**s.to_dict())`` reconstruction path in ``_all_skills``.
+    restored = Skill(**payload)
+    assert restored.default_timeout_s == 120.0
+
+
+def test_skill_default_timeout_s_omitted_when_none_in_to_dict():
+    """None means unset; stay out of the serialized payload entirely.
+
+    This matches the existing convention for every other optional field
+    on Skill.to_dict (capability, output_contract, metadata, etc.).
+    """
+    s = Skill("echo", "Echo the input")
+    payload = s.to_dict()
+    assert "default_timeout_s" not in payload
+
+
+def test_skill_absent_default_timeout_s_key_deserializes_to_none():
+    """Older serialized payloads (no default_timeout_s key) must load cleanly."""
+    legacy_payload = {
+        "name": "legacy_skill",
+        "description": "Predates default_timeout_s",
+        "parameters": {},
+        "since": "0.1.0",
+    }
+    s = Skill(**legacy_payload)
+    assert s.default_timeout_s is None
+
+
+def test_skill_default_timeout_s_rejects_zero():
+    with pytest.raises(ValueError, match="default_timeout_s"):
+        Skill("bad", default_timeout_s=0)
+
+
+def test_skill_default_timeout_s_rejects_negative():
+    with pytest.raises(ValueError, match="default_timeout_s"):
+        Skill("bad", default_timeout_s=-5)
+
+
+def test_skill_default_timeout_s_rejects_non_numeric():
+    with pytest.raises(TypeError, match="default_timeout_s"):
+        Skill("bad", default_timeout_s="120")
+
+
+def test_skill_default_timeout_s_rejects_bool():
+    """``True`` is technically an int in Python; reject it explicitly to
+    avoid an author typo silently becoming a 1-second timeout."""
+    with pytest.raises(TypeError, match="default_timeout_s"):
+        Skill("bad", default_timeout_s=True)

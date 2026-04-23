@@ -101,6 +101,22 @@ class Skill:
     aliases: list[str] = field(default_factory=list)
     execution_profiles: list[ExecutionProfile | dict[str, Any]] = field(default_factory=list)
     runtime_profile: RuntimeProfile | dict[str, Any] | None = None
+    default_timeout_s: float | None = None
+    """Author-declared default timeout (seconds) for calls to this skill.
+
+    Consumed by the MCP adapter's timeout precedence ladder
+    (fr_khonliang_a3dc662d) at step 2, used when no per-call
+    ``_mcp_timeout`` hint is supplied:
+
+        per-call ``_mcp_timeout`` hint
+        → Skill.default_timeout_s  ← this field
+        → env / CLI adapter default
+        → library fallback
+
+    ``None`` means "not set" — the ladder falls through to the env/CLI
+    default. Must be a positive number when set; zero and negative
+    values are rejected.
+    """
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -127,6 +143,21 @@ class Skill:
                 if isinstance(self.runtime_profile, RuntimeProfile)
                 else RuntimeProfile.from_dict(self.runtime_profile)
             )
+        if self.default_timeout_s is not None:
+            # Accept ints gracefully; the ladder treats them as seconds.
+            if isinstance(self.default_timeout_s, bool) or not isinstance(
+                self.default_timeout_s, (int, float)
+            ):
+                raise TypeError(
+                    "default_timeout_s must be a number (got "
+                    f"{type(self.default_timeout_s).__name__})"
+                )
+            if self.default_timeout_s <= 0:
+                raise ValueError(
+                    "default_timeout_s must be > 0 (got "
+                    f"{self.default_timeout_s})"
+                )
+            self.default_timeout_s = float(self.default_timeout_s)
         self.metadata = dict(self.metadata)
 
     def to_dict(self) -> dict[str, Any]:
@@ -161,6 +192,7 @@ class Skill:
                 if isinstance(self.runtime_profile, RuntimeProfile)
                 else None
             ),
+            "default_timeout_s": self.default_timeout_s,
             "metadata": self.metadata,
         }
         payload.update({

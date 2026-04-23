@@ -87,7 +87,15 @@ def _has_explicit_version(agent: "BaseAgent") -> bool:
 
 @dataclass
 class Skill:
-    """A skill this agent can handle."""
+    """A skill this agent can handle.
+
+    The optional ``default_timeout_s`` field is an author-declared default
+    timeout (seconds) for calls to this skill. It is consumed by the MCP
+    adapter's timeout precedence ladder (fr_khonliang_a3dc662d) at step 2,
+    used when no per-call ``_mcp_timeout`` hint is supplied. ``None`` means
+    "not set"; the ladder falls through to the env/CLI default. Must be a
+    positive number when set; zero and negative values are rejected.
+    """
 
     name: str
     description: str = ""
@@ -101,23 +109,16 @@ class Skill:
     aliases: list[str] = field(default_factory=list)
     execution_profiles: list[ExecutionProfile | dict[str, Any]] = field(default_factory=list)
     runtime_profile: RuntimeProfile | dict[str, Any] | None = None
-    default_timeout_s: float | None = None
-    """Author-declared default timeout (seconds) for calls to this skill.
-
-    Consumed by the MCP adapter's timeout precedence ladder
-    (fr_khonliang_a3dc662d) at step 2, used when no per-call
-    ``_mcp_timeout`` hint is supplied:
-
-        per-call ``_mcp_timeout`` hint
-        → Skill.default_timeout_s  ← this field
-        → env / CLI adapter default
-        → library fallback
-
-    ``None`` means "not set" — the ladder falls through to the env/CLI
-    default. Must be a positive number when set; zero and negative
-    values are rejected.
-    """
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Consumed by the MCP adapter's timeout precedence ladder
+    # (fr_khonliang_a3dc662d) at step 2:
+    #   per-call ``_mcp_timeout`` hint
+    #     → Skill.default_timeout_s  ← this field
+    #     → env / CLI adapter default
+    #     → library fallback
+    # Appended at the end of the field list to preserve positional-arg
+    # compatibility for existing ``Skill(...)`` call sites.
+    default_timeout_s: float | None = None
 
     def __post_init__(self) -> None:
         self.parameters = dict(self.parameters)

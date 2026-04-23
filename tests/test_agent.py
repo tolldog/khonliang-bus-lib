@@ -465,6 +465,36 @@ def test_skill_default_timeout_s_defaults_to_none():
     assert s.default_timeout_s is None
 
 
+def test_skill_positional_args_preserve_metadata_slot():
+    """Back-compat: appending ``default_timeout_s`` at the END of the
+    dataclass field list must not shift the positional-arg slot of
+    ``metadata`` (or any pre-existing field). A caller that passed
+    ``metadata`` positionally before this field landed must still hit
+    ``metadata`` — not ``default_timeout_s`` — after.
+
+    Positional order for Skill is: name, description, parameters, since,
+    capability, input_schema, output_contract, authority, status, aliases,
+    execution_profiles, runtime_profile, metadata, default_timeout_s.
+    """
+    s = Skill(
+        "name",
+        "desc",
+        {"handler": "schema"},
+        "0.1.0",
+        "cap",
+        {"handler": "schema"},
+        None,
+        "authoritative",
+        "active",
+        [],
+        [],
+        None,
+        {"foo": "bar"},
+    )
+    assert s.metadata == {"foo": "bar"}
+    assert s.default_timeout_s is None
+
+
 def test_skill_default_timeout_s_accepts_positive_float():
     s = Skill("review_pr", "Slow skill", default_timeout_s=120.0)
     assert s.default_timeout_s == 120.0
@@ -482,8 +512,8 @@ def test_skill_default_timeout_s_round_trips_through_to_dict():
     s = Skill("review_pr", "Slow skill", default_timeout_s=120.0)
     payload = s.to_dict()
     assert payload["default_timeout_s"] == 120.0
-    # Reconstruct from the serialized payload — older dispatch path
-    # (e.g. agent.py:307) uses Skill(**s.to_dict()).
+    # Reconstruct from the serialized payload — mirrors the
+    # ``Skill(**s.to_dict())`` reconstruction path in ``_all_skills``.
     restored = Skill(**payload)
     assert restored.default_timeout_s == 120.0
 

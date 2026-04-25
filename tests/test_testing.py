@@ -73,6 +73,27 @@ def test_assert_skill_fails_when_missing(harness):
         harness.assert_skill_exists("ghost")
 
 
+def test_handler_names_includes_subclass_handlers(harness):
+    # Both @handler decorators on SampleAgent show up plus the BaseAgent
+    # built-in health_check handler.
+    assert {"greet", "add", "health_check"} <= harness.handler_names
+
+
+def test_all_skill_names_includes_built_ins(harness):
+    # SampleAgent.register_skills returns greet+add only; all_skill_names
+    # composes those with BaseAgent built-ins (health_check).
+    assert harness.all_skill_names == {"greet", "add", "health_check"}
+    assert harness.skill_names == {"greet", "add"}
+
+
+def test_handler_skill_symmetry_for_sample_agent(harness):
+    # Canonical use case for the new accessors: the symmetry check the
+    # accessors were added to support. SampleAgent doesn't register
+    # health_check explicitly, but BaseAgent contributes both the handler
+    # and the Skill, so the sets should match.
+    assert harness.handler_names == harness.all_skill_names
+
+
 # -- collaborations --
 
 def test_collaboration_names(harness):

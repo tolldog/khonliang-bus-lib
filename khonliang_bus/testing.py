@@ -103,13 +103,36 @@ class AgentTestHarness:
 
     @property
     def skill_names(self) -> set[str]:
-        """Set of registered skill names."""
+        """Set of registered skill names — subclass register_skills only."""
         return {s.name for s in self._skills}
 
     @property
     def skills(self) -> list[Skill]:
-        """Registered Skill objects."""
+        """Registered Skill objects — subclass register_skills only."""
         return list(self._skills)
+
+    @property
+    def all_skill_names(self) -> set[str]:
+        """Set of every skill name the agent advertises — subclass
+        ``register_skills`` plus :class:`BaseAgent` built-ins like the
+        default ``health_check``. Use this rather than
+        :attr:`skill_names` when asserting symmetry against
+        :attr:`handler_names`, since BaseAgent's built-in handlers are
+        always present even when the subclass omits them from
+        ``register_skills``.
+        """
+        return {s.name for s in self.agent._all_skills()}
+
+    @property
+    def handler_names(self) -> set[str]:
+        """Set of every ``@handler`` operation name on the agent.
+
+        Sourced from the same internal handler registry that
+        :meth:`call` dispatches against, so what you see here is what
+        the agent will actually answer. Pair with :attr:`all_skill_names`
+        for set-symmetry registration checks.
+        """
+        return set(self.agent._handlers)
 
     @property
     def collaboration_names(self) -> set[str]:

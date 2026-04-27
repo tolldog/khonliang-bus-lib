@@ -82,9 +82,11 @@ def test_collaborations_registered(agent):
 # -- handlers --
 
 def test_handlers_collected(agent):
-    # EchoAgent declares echo/upper/fail; health_check + welcome come for
-    # free from BaseAgent's BUILT_IN_SKILLS.
-    assert set(agent._handlers) == {"echo", "upper", "fail", "health_check", "welcome"}
+    # EchoAgent declares echo/upper/fail; health_check + welcome + help
+    # come for free from BaseAgent's BUILT_IN_SKILLS.
+    assert set(agent._handlers) == {
+        "echo", "upper", "fail", "health_check", "welcome", "help",
+    }
 
 
 @pytest.mark.asyncio
@@ -283,13 +285,15 @@ def test_bare_agent_advertises_builtins():
     """An agent with no skills of its own still gets the built-ins."""
     a = BareAgent(agent_id="bare", bus_url="http://localhost:9999")
     names = {s.name for s in a._all_skills()}
-    assert names == {"health_check", "welcome"}
+    assert names == {"health_check", "welcome", "help"}
 
 
 def test_subclass_skills_augmented_with_builtins(agent):
-    """Subclass skills + built-in health_check + welcome are merged."""
+    """Subclass skills + the three built-ins are merged."""
     names = {s.name for s in agent._all_skills()}
-    assert names == {"echo", "upper", "fail", "health_check", "welcome"}
+    assert names == {
+        "echo", "upper", "fail", "health_check", "welcome", "help",
+    }
 
 
 def test_register_skills_unchanged_by_builtins(agent):
@@ -637,7 +641,7 @@ async def test_welcome_default_brief_announces_undocumented(agent):
     assert result["agent_id"] == "echo-test"
     assert result["agent_type"] == "echo"
     assert result["version"] == "0.2.0"
-    assert result["skill_count"] == 5  # echo, upper, fail, health_check, welcome
+    assert result["skill_count"] == 6  # echo, upper, fail, health_check, welcome
     # Synthesized fallback editorial — the lib announces the undocumented
     # state instead of returning a sparse silent response.
     assert result["role"].startswith("(undocumented agent")
@@ -657,7 +661,7 @@ async def test_welcome_default_brief_announces_undocumented(agent):
     # Categories still present at brief detail.
     assert "skill_categories" in result
     # health_check + welcome are the builtin category.
-    assert result["skill_categories"]["builtin"] == 2
+    assert result["skill_categories"]["builtin"] == 3
 
 
 @pytest.mark.asyncio
@@ -674,7 +678,7 @@ async def test_welcome_default_compact_keeps_role_marker(agent):
     assert "mission" not in result
     assert "documentation_gaps" not in result
     assert "skill_documentation_gaps" not in result
-    assert result["skill_count"] == 5
+    assert result["skill_count"] == 6
 
 
 @pytest.mark.asyncio
@@ -711,7 +715,7 @@ async def test_welcome_full_lists_skills_per_category(agent):
     # echo / upper / fail have no underscore prefix → 'misc'.
     assert set(cats["misc"]) == {"echo", "upper", "fail"}
     # builtins are in their own bucket.
-    assert set(cats["builtin"]) == {"health_check", "welcome"}
+    assert set(cats["builtin"]) == {"health_check", "welcome", "help"}
 
 
 @pytest.mark.asyncio
@@ -793,7 +797,7 @@ async def test_welcome_categorizes_by_underscore_prefix():
     # 'git_status' → 'git' bucket.
     assert cats["git"] == ["git_status"]
     # builtins separately.
-    assert set(cats["builtin"]) == {"health_check", "welcome"}
+    assert set(cats["builtin"]) == {"health_check", "welcome", "help"}
 
 
 def test_welcome_dataclass_to_dict_drops_empty_fields():
@@ -827,7 +831,7 @@ async def test_welcome_detail_none_treated_as_default(agent):
     )
     # No error; same shape as the default brief response.
     assert "error" not in result
-    assert result["skill_count"] == 5
+    assert result["skill_count"] == 6
     assert "skill_categories" in result
 
 
@@ -913,7 +917,7 @@ async def test_welcome_handles_null_args_cleanly(agent):
     )
     assert "error" not in result
     assert result["agent_id"] == "echo-test"
-    assert result["skill_count"] == 5
+    assert result["skill_count"] == 6
 
 
 @pytest.mark.asyncio
@@ -943,3 +947,259 @@ def test_skill_doc_gaps_flags_missing_fields():
     assert "description is empty" in gaps
     assert "parameters / input_schema not declared" in gaps
     assert "capability tag not set" in gaps
+
+
+# ---------------------------------------------------------------------------
+# help skill (fr_khonliang-bus-lib_42555320 + fr_khonliang-bus-lib_6e42567d)
+# ---------------------------------------------------------------------------
+
+
+class AspectAgent(BaseAgent):
+    """Agent with skills that populate the new aspect fields so the
+    help-skill aspect-mode tests can check round-trip."""
+
+    agent_type = "aspect"
+    module_name = "tests.test_agent"
+    version = "0.3.0"
+
+    def register_skills(self):
+        return [
+            Skill(
+                name="distill_paper",
+                description="Run LLM distillation on a stored paper.",
+                parameters={"paper_id": {"type": "string"}},
+                capability="research.distill",
+                prompt=(
+                    "Use distill_paper to summarize a paper that's "
+                    "already been ingested. Pass paper_id from the "
+                    "ingest response. The skill returns "
+                    "{summary, triples, applicability}."
+                ),
+                examples=[
+                    {
+                        "input_args": {"paper_id": "pp_abc123"},
+                        "expected_output_shape": (
+                            "{summary: str, triples: list, applicability: dict}"
+                        ),
+                        "narrative": "Distill a known paper id.",
+                    }
+                ],
+                pairs_with=["fetch_paper", "find_relevant"],
+                not_appropriate_for=[
+                    "binary attachments — use stage_payload",
+                    "freeform text without an ingested paper id",
+                ],
+            ),
+            Skill(
+                name="bare_skill",
+                description="Skill with no aspect fields populated.",
+                parameters={},
+            ),
+        ]
+
+
+@pytest.fixture
+def aspect_agent():
+    return AspectAgent(agent_id="aspect-test", bus_url="http://localhost:9999")
+
+
+@pytest.mark.asyncio
+async def test_help_empty_list_returns_full_catalog(agent):
+    """``help([])`` shorthand returns every registered skill."""
+    result = await agent._dispatch_request(
+        {"operation": "help", "args": {"skill_names": []}}
+    )
+    names = {s["name"] for s in result["skills"]}
+    # Subclass skills + the three built-ins.
+    assert names == {
+        "echo", "upper", "fail", "health_check", "welcome", "help",
+    }
+    # Every entry is found.
+    assert all(s["found"] for s in result["skills"])
+
+
+@pytest.mark.asyncio
+async def test_help_unknown_name_marks_found_false_with_reason(agent):
+    """Unknown skill names appear with ``found: false`` and a reason
+    string — never silently dropped, so callers learn what missed."""
+    result = await agent._dispatch_request(
+        {"operation": "help", "args": {"skill_names": ["nonexistent"]}}
+    )
+    assert len(result["skills"]) == 1
+    entry = result["skills"][0]
+    assert entry["name"] == "nonexistent"
+    assert entry["found"] is False
+    assert "no skill" in entry["reason"]
+
+
+@pytest.mark.asyncio
+async def test_help_mixed_known_and_unknown_names_all_surface(agent):
+    """Mixed lookups preserve order: known entries get full info,
+    unknown entries get found:false. Both appear so the caller can
+    correlate by index/name."""
+    result = await agent._dispatch_request(
+        {"operation": "help", "args": {"skill_names": ["echo", "ghost"]}}
+    )
+    assert [s["name"] for s in result["skills"]] == ["echo", "ghost"]
+    assert result["skills"][0]["found"] is True
+    assert result["skills"][1]["found"] is False
+
+
+@pytest.mark.asyncio
+async def test_help_compact_returns_only_name_and_description(agent):
+    """``detail=compact`` is the cheapest read — name + description
+    only; no parameters / input_schema / aspect fields."""
+    result = await agent._dispatch_request(
+        {"operation": "help", "args": {"skill_names": ["echo"], "detail": "compact"}}
+    )
+    entry = result["skills"][0]
+    assert entry["name"] == "echo"
+    assert entry["description"] == "Echo the input"
+    assert "parameters" not in entry
+    assert "input_schema" not in entry
+    assert "prompt" not in entry
+
+
+@pytest.mark.asyncio
+async def test_help_brief_includes_parameters(agent):
+    """``detail=brief`` (default) adds parameters / input_schema /
+    capability — the args contract the caller actually needs."""
+    result = await agent._dispatch_request(
+        {"operation": "help", "args": {"skill_names": ["echo"]}}
+    )
+    entry = result["skills"][0]
+    assert "parameters" in entry
+    assert entry["parameters"] == {"text": {"type": "string"}}
+
+
+@pytest.mark.asyncio
+async def test_help_full_surfaces_populated_aspect_fields(aspect_agent):
+    """``detail=full`` adds aspect fields ONLY when populated. Skills
+    that didn't declare aspects don't get noisy empty entries."""
+    result = await aspect_agent._dispatch_request(
+        {"operation": "help", "args": {"skill_names": [], "detail": "full"}}
+    )
+    by_name = {s["name"]: s for s in result["skills"]}
+    distill = by_name["distill_paper"]
+    assert distill["prompt"].startswith("Use distill_paper")
+    assert distill["pairs_with"] == ["fetch_paper", "find_relevant"]
+    assert distill["not_appropriate_for"][0].startswith("binary attachments")
+    assert len(distill["examples"]) == 1
+    bare = by_name["bare_skill"]
+    # bare_skill declared no aspect fields — entry stays signal-dense.
+    assert "prompt" not in bare
+    assert "pairs_with" not in bare
+    assert "examples" not in bare
+
+
+@pytest.mark.asyncio
+async def test_help_aspect_mode_returns_flat_value_list(aspect_agent):
+    """Aspect-mode read returns ``{name, found, value}`` per skill —
+    token-efficient for callers that already know which slice they
+    want (LLM asking for prompt to adapt a template, sibling agent
+    asking for schema to validate a call)."""
+    result = await aspect_agent._dispatch_request(
+        {
+            "operation": "help",
+            "args": {"skill_names": ["distill_paper"], "aspect": "prompt"},
+        }
+    )
+    assert result["aspect"] == "prompt"
+    assert len(result["skills"]) == 1
+    entry = result["skills"][0]
+    assert entry["name"] == "distill_paper"
+    assert entry["found"] is True
+    assert entry["value"].startswith("Use distill_paper")
+
+
+@pytest.mark.asyncio
+async def test_help_aspect_schema_falls_back_to_parameters(aspect_agent):
+    """When ``input_schema`` is empty, ``aspect=schema`` falls back to
+    ``parameters`` — legacy Skill registrations that only set
+    parameters still answer the schema aspect correctly."""
+    result = await aspect_agent._dispatch_request(
+        {
+            "operation": "help",
+            "args": {"skill_names": ["distill_paper"], "aspect": "schema"},
+        }
+    )
+    assert result["skills"][0]["value"] == {"paper_id": {"type": "string"}}
+
+
+@pytest.mark.asyncio
+async def test_help_aspect_unknown_skill_marks_found_false(aspect_agent):
+    """Unknown skills in aspect mode also surface as found:false."""
+    result = await aspect_agent._dispatch_request(
+        {
+            "operation": "help",
+            "args": {"skill_names": ["ghost"], "aspect": "prompt"},
+        }
+    )
+    entry = result["skills"][0]
+    assert entry["found"] is False
+    assert "no skill" in entry["reason"]
+    # No 'value' key when not found.
+    assert "value" not in entry
+
+
+@pytest.mark.asyncio
+async def test_help_rejects_invalid_aspect(aspect_agent):
+    """An unknown aspect string returns a validation envelope listing
+    the accepted values — caller learns the contract without re-reading
+    the source."""
+    result = await aspect_agent._dispatch_request(
+        {"operation": "help", "args": {"skill_names": [], "aspect": "bogus"}}
+    )
+    assert "error" in result
+    assert "prompt" in result["error"]
+    assert "schema" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_help_rejects_invalid_detail(aspect_agent):
+    """An unknown detail level returns a validation envelope."""
+    result = await aspect_agent._dispatch_request(
+        {"operation": "help", "args": {"skill_names": [], "detail": "bogus"}}
+    )
+    assert "error" in result
+    assert "compact|brief|full" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_help_rejects_non_list_skill_names(aspect_agent):
+    """``skill_names`` must be a list — a string here is the easy
+    mistake (caller passing one name unwrapped)."""
+    result = await aspect_agent._dispatch_request(
+        {"operation": "help", "args": {"skill_names": "echo"}}
+    )
+    assert "error" in result
+    assert "list" in result["error"]
+
+
+def test_skill_aspect_fields_round_trip_through_to_dict():
+    """The new aspect fields survive the registration-payload round
+    trip and are dropped (not faked) when empty — matches the existing
+    optional-field convention."""
+    s = Skill(
+        name="x",
+        description="d",
+        parameters={"q": {"type": "string"}},
+        prompt="example template",
+        examples=[{"input_args": {}, "expected_output_shape": "ok"}],
+        pairs_with=["y"],
+        not_appropriate_for=["z"],
+    )
+    payload = s.to_dict()
+    assert payload["prompt"] == "example template"
+    assert payload["pairs_with"] == ["y"]
+    assert payload["not_appropriate_for"] == ["z"]
+    assert len(payload["examples"]) == 1
+
+    bare = Skill(name="bare", description="d")
+    bare_payload = bare.to_dict()
+    # Empty aspect fields stay out of the payload — bus registration
+    # response stays signal-dense.
+    assert "prompt" not in bare_payload
+    assert "pairs_with" not in bare_payload
+    assert "not_appropriate_for" not in bare_payload
+    assert "examples" not in bare_payload

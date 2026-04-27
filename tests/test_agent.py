@@ -577,37 +577,76 @@ def test_skill_default_timeout_s_rejects_bool():
 
 
 @pytest.mark.asyncio
-async def test_welcome_default_brief_returns_identity_and_categories(agent):
-    """Bare agent (no WELCOME override) gets identity + skill_categories.
-
-    No editorial fields when WELCOME is left at its empty default.
-    """
+async def test_welcome_default_brief_announces_undocumented(agent):
+    """Bare agent (no WELCOME override) returns a 'please document me'
+    fallback: identity + auto-derived skill catalog + explicit
+    missing-doc markers and a checklist of agent-level fields that
+    need filling."""
     result = await agent._dispatch_request({"operation": "welcome", "args": {}})
     assert result["agent_id"] == "echo-test"
     assert result["agent_type"] == "echo"
     assert result["version"] == "0.2.0"
     assert result["skill_count"] == 5  # echo, upper, fail, health_check, welcome
-    # Editorial fields absent because WELCOME is the empty default.
-    assert "role" not in result
-    assert "mission" not in result
+    # Synthesized fallback editorial — the lib announces the undocumented
+    # state instead of returning a sparse silent response.
+    assert result["role"].startswith("(undocumented agent")
+    assert "WELCOME" in result["mission"]
+    assert "fr_khonliang-bus-lib_6a82732c" in result["mission"]
+    # Agent-level checklist: every editorial field that should be filled.
+    assert result["documentation_gaps"] == [
+        "role",
+        "mission",
+        "boundaries (not_responsible_for + delegates_to)",
+        "entry_points",
+        "guide_skill",
+    ]
+    # No editorial sub-keys — these would mean the agent IS documented.
     assert "boundaries" not in result
     assert "entry_points" not in result
-    # Categories present at brief detail.
+    # Categories still present at brief detail.
     assert "skill_categories" in result
     # health_check + welcome are the builtin category.
     assert result["skill_categories"]["builtin"] == 2
 
 
 @pytest.mark.asyncio
-async def test_welcome_compact_omits_categories(agent):
-    """compact returns only identity + role; no skill catalog."""
+async def test_welcome_default_compact_keeps_role_marker(agent):
+    """compact still returns the missing-doc role marker so even the
+    cheapest welcome variant tells the consumer the agent is
+    undocumented; mission / categories / gaps stay absent at compact."""
     result = await agent._dispatch_request(
         {"operation": "welcome", "args": {"detail": "compact"}}
     )
+    assert result["role"].startswith("(undocumented agent")
     assert "skill_categories" not in result
     assert "skills_by_category" not in result
     assert "mission" not in result
+    assert "documentation_gaps" not in result
+    assert "skill_documentation_gaps" not in result
     assert result["skill_count"] == 5
+
+
+@pytest.mark.asyncio
+async def test_welcome_default_full_lists_per_skill_documentation_gaps(agent):
+    """At full detail, undocumented agents emit a per-skill gap map so
+    a documenting LLM can target each skill's missing fields."""
+    result = await agent._dispatch_request(
+        {"operation": "welcome", "args": {"detail": "full"}}
+    )
+    gaps_by_skill = result["skill_documentation_gaps"]
+    # ``upper`` and ``fail`` were registered without parameters → they
+    # flag both "parameters / input_schema not declared" and
+    # "capability tag not set"; ``echo`` only flags capability.
+    assert "parameters / input_schema not declared" in gaps_by_skill["upper"]
+    assert "capability tag not set" in gaps_by_skill["upper"]
+    assert "capability tag not set" in gaps_by_skill["echo"]
+    # ``echo`` HAS parameters, so no parameters-gap entry.
+    assert "parameters / input_schema not declared" not in gaps_by_skill["echo"]
+    # Built-ins also surface so the lib's own undocumented surface is
+    # visible — operators see what THEY would need to populate to make
+    # the platform fully self-documenting.
+    assert "health_check" in gaps_by_skill
+    assert "welcome" in gaps_by_skill
 
 
 @pytest.mark.asyncio
@@ -755,3 +794,62 @@ def test_welcome_entry_point_is_frozen():
     ep = WelcomeEntryPoint(skill="x", when_to_use="y")
     with pytest.raises(dataclasses.FrozenInstanceError):
         ep.skill = "z"
+
+
+def test_welcome_collections_are_immutable_after_construction():
+    """Callers may pass list/dict literals for convenience, but the
+    stored fields are coerced to truly-immutable shapes (tuple /
+    MappingProxyType). Mutating the original literals doesn't leak
+    into the Welcome instance, and the stored collections themselves
+    cannot be mutated in place — addressing the shared-default
+    leakage class structurally rather than via convention."""
+    from types import MappingProxyType
+
+    src_list = ["paper ingestion (researcher)"]
+    src_dict = {"researcher": "evidence/context only"}
+    src_eps = [WelcomeEntryPoint(skill="x", when_to_use="y")]
+    w = Welcome(
+        not_responsible_for=src_list,
+        delegates_to=src_dict,
+        entry_points=src_eps,
+    )
+    assert isinstance(w.not_responsible_for, tuple)
+    assert isinstance(w.delegates_to, MappingProxyType)
+    assert isinstance(w.entry_points, tuple)
+
+    # Mutating the original literals after construction must not bleed
+    # into ``w`` — coercion is by-value.
+    src_list.append("leaked")
+    src_dict["new"] = "leaked"
+    src_eps.append(WelcomeEntryPoint(skill="leaked", when_to_use="leaked"))
+    assert w.not_responsible_for == ("paper ingestion (researcher)",)
+    assert dict(w.delegates_to) == {"researcher": "evidence/context only"}
+    assert len(w.entry_points) == 1
+
+    # Direct mutation of the stored collections fails.
+    with pytest.raises((AttributeError, TypeError)):
+        w.not_responsible_for.append("x")  # type: ignore[attr-defined]
+    with pytest.raises(TypeError):
+        w.delegates_to["new"] = "x"  # type: ignore[index]
+    with pytest.raises((AttributeError, TypeError)):
+        w.entry_points.append(  # type: ignore[attr-defined]
+            WelcomeEntryPoint(skill="x", when_to_use="y")
+        )
+
+
+def test_skill_doc_gaps_flags_missing_fields():
+    """The per-skill gap helper reports description / parameters /
+    capability gaps independently."""
+    fully_documented = Skill(
+        name="x",
+        description="does the thing",
+        parameters={"q": {"type": "string"}},
+        capability="x.do",
+    )
+    assert BaseAgent._skill_doc_gaps(fully_documented) == []
+
+    bare = Skill(name="y")
+    gaps = BaseAgent._skill_doc_gaps(bare)
+    assert "description is empty" in gaps
+    assert "parameters / input_schema not declared" in gaps
+    assert "capability tag not set" in gaps

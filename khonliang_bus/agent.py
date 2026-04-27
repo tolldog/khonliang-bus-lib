@@ -488,7 +488,7 @@ class BaseAgent:
         return subclass_skills + extras
 
     @handler("welcome")
-    async def handle_welcome(self, args: dict) -> dict:
+    async def handle_welcome(self, args: Any) -> dict:
         """Return cold-start orientation: identity + role + skill catalog.
 
         Auto-derived fields always present: agent_id, agent_type,

@@ -81,8 +81,8 @@ def test_handler_names_includes_subclass_handlers(harness):
 
 def test_all_skill_names_includes_built_ins(harness):
     # SampleAgent.register_skills returns greet+add only; all_skill_names
-    # composes those with BaseAgent built-ins (health_check).
-    assert harness.all_skill_names == {"greet", "add", "health_check"}
+    # composes those with BaseAgent built-ins (health_check + welcome).
+    assert harness.all_skill_names == {"greet", "add", "health_check", "welcome"}
     assert harness.skill_names == {"greet", "add"}
 
 

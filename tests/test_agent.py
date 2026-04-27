@@ -6,7 +6,14 @@ import asyncio
 
 import pytest
 
-from khonliang_bus import BaseAgent, Skill, Collaboration, handler
+from khonliang_bus import (
+    BaseAgent,
+    Collaboration,
+    Skill,
+    Welcome,
+    WelcomeEntryPoint,
+    handler,
+)
 
 
 class EchoAgent(BaseAgent):
@@ -75,8 +82,9 @@ def test_collaborations_registered(agent):
 # -- handlers --
 
 def test_handlers_collected(agent):
-    # EchoAgent declares echo/upper/fail; health_check comes for free from BaseAgent.
-    assert set(agent._handlers) == {"echo", "upper", "fail", "health_check"}
+    # EchoAgent declares echo/upper/fail; health_check + welcome come for
+    # free from BaseAgent's BUILT_IN_SKILLS.
+    assert set(agent._handlers) == {"echo", "upper", "fail", "health_check", "welcome"}
 
 
 @pytest.mark.asyncio
@@ -220,17 +228,17 @@ class BareAgent(BaseAgent):
     version = "1.0.0"
 
 
-def test_bare_agent_advertises_health_check():
-    """An agent with no skills of its own still gets health_check."""
+def test_bare_agent_advertises_builtins():
+    """An agent with no skills of its own still gets the built-ins."""
     a = BareAgent(agent_id="bare", bus_url="http://localhost:9999")
     names = {s.name for s in a._all_skills()}
-    assert names == {"health_check"}
+    assert names == {"health_check", "welcome"}
 
 
-def test_subclass_skills_augmented_with_health_check(agent):
-    """Subclass skills + built-in health_check are merged."""
+def test_subclass_skills_augmented_with_builtins(agent):
+    """Subclass skills + built-in health_check + welcome are merged."""
     names = {s.name for s in agent._all_skills()}
-    assert names == {"echo", "upper", "fail", "health_check"}
+    assert names == {"echo", "upper", "fail", "health_check", "welcome"}
 
 
 def test_register_skills_unchanged_by_builtins(agent):
@@ -561,3 +569,159 @@ def test_skill_default_timeout_s_rejects_bool():
     avoid an author typo silently becoming a 1-second timeout."""
     with pytest.raises(TypeError, match="default_timeout_s"):
         Skill("bad", default_timeout_s=True)
+
+
+# ---------------------------------------------------------------------------
+# welcome (fr_khonliang-bus-lib_6a82732c)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_welcome_default_brief_returns_identity_and_categories(agent):
+    """Bare agent (no WELCOME override) gets identity + skill_categories.
+
+    No editorial fields when WELCOME is left at its empty default.
+    """
+    result = await agent._dispatch_request({"operation": "welcome", "args": {}})
+    assert result["agent_id"] == "echo-test"
+    assert result["agent_type"] == "echo"
+    assert result["version"] == "0.2.0"
+    assert result["skill_count"] == 5  # echo, upper, fail, health_check, welcome
+    # Editorial fields absent because WELCOME is the empty default.
+    assert "role" not in result
+    assert "mission" not in result
+    assert "boundaries" not in result
+    assert "entry_points" not in result
+    # Categories present at brief detail.
+    assert "skill_categories" in result
+    # health_check + welcome are the builtin category.
+    assert result["skill_categories"]["builtin"] == 2
+
+
+@pytest.mark.asyncio
+async def test_welcome_compact_omits_categories(agent):
+    """compact returns only identity + role; no skill catalog."""
+    result = await agent._dispatch_request(
+        {"operation": "welcome", "args": {"detail": "compact"}}
+    )
+    assert "skill_categories" not in result
+    assert "skills_by_category" not in result
+    assert "mission" not in result
+    assert result["skill_count"] == 5
+
+
+@pytest.mark.asyncio
+async def test_welcome_full_lists_skills_per_category(agent):
+    """full detail enumerates skill names per category."""
+    result = await agent._dispatch_request(
+        {"operation": "welcome", "args": {"detail": "full"}}
+    )
+    assert "skills_by_category" in result
+    cats = result["skills_by_category"]
+    # echo / upper / fail have no underscore prefix → 'misc'.
+    assert set(cats["misc"]) == {"echo", "upper", "fail"}
+    # builtins are in their own bucket.
+    assert set(cats["builtin"]) == {"health_check", "welcome"}
+
+
+@pytest.mark.asyncio
+async def test_welcome_invalid_detail_returns_error(agent):
+    result = await agent._dispatch_request(
+        {"operation": "welcome", "args": {"detail": "bogus"}}
+    )
+    assert "error" in result
+    assert "compact|brief|full" in result["error"]
+
+
+# -- editorial WELCOME override --
+
+
+class CuratedAgent(BaseAgent):
+    """Agent with a populated WELCOME override."""
+
+    agent_type = "curated"
+    module_name = "tests.test_agent"
+    version = "1.0.0"
+
+    WELCOME = Welcome(
+        role="curated test agent",
+        mission="Demonstrates the editorial fields surfaced via welcome.",
+        not_responsible_for=["paper ingestion (researcher)"],
+        delegates_to={"researcher": "evidence/context only"},
+        entry_points=[
+            WelcomeEntryPoint(skill="curated_action", when_to_use="for curated workflows"),
+        ],
+        guide_skill="curated_guide",
+    )
+
+    def register_skills(self):
+        return [
+            Skill("curated_action", "Run a curated workflow"),
+            Skill("curated_guide", "Curated workflow guide"),
+            Skill("git_status", "Stub git skill — exercises category prefix"),
+        ]
+
+
+@pytest.mark.asyncio
+async def test_welcome_brief_includes_editorial_fields():
+    a = CuratedAgent(agent_id="cur", bus_url="http://localhost:9999")
+    result = await a._dispatch_request({"operation": "welcome", "args": {}})
+    assert result["role"] == "curated test agent"
+    assert result["mission"].startswith("Demonstrates")
+    assert result["boundaries"]["not_responsible_for"] == ["paper ingestion (researcher)"]
+    assert result["boundaries"]["delegates_to"] == {"researcher": "evidence/context only"}
+    assert result["entry_points"] == [
+        {"skill": "curated_action", "when_to_use": "for curated workflows"}
+    ]
+    assert result["guide_skill"] == "curated_guide"
+
+
+@pytest.mark.asyncio
+async def test_welcome_compact_keeps_role_drops_mission():
+    a = CuratedAgent(agent_id="cur", bus_url="http://localhost:9999")
+    result = await a._dispatch_request(
+        {"operation": "welcome", "args": {"detail": "compact"}}
+    )
+    # compact: keep role for context, drop the longer-form fields.
+    assert result["role"] == "curated test agent"
+    assert "mission" not in result
+    assert "boundaries" not in result
+    assert "entry_points" not in result
+    assert "skill_categories" not in result
+
+
+@pytest.mark.asyncio
+async def test_welcome_categorizes_by_underscore_prefix():
+    """Skills with an underscore prefix go to that category bucket."""
+    a = CuratedAgent(agent_id="cur", bus_url="http://localhost:9999")
+    result = await a._dispatch_request(
+        {"operation": "welcome", "args": {"detail": "full"}}
+    )
+    cats = result["skills_by_category"]
+    # 'curated_action' / 'curated_guide' → 'curated' bucket.
+    assert set(cats["curated"]) == {"curated_action", "curated_guide"}
+    # 'git_status' → 'git' bucket.
+    assert cats["git"] == ["git_status"]
+    # builtins separately.
+    assert set(cats["builtin"]) == {"health_check", "welcome"}
+
+
+def test_welcome_dataclass_to_dict_drops_empty_fields():
+    """An empty Welcome serializes to {} so welcome's auto-derived
+    fields are the only ones present."""
+    assert Welcome().to_dict() == {}
+
+
+def test_welcome_dataclass_to_dict_drops_individually_empty_fields():
+    """Partial population: only populated fields appear."""
+    w = Welcome(role="x")
+    assert w.to_dict() == {"role": "x"}
+
+
+def test_welcome_dataclass_collapses_boundaries():
+    """boundaries dict only appears if at least one of its sub-fields is set."""
+    w = Welcome(role="x", not_responsible_for=["y"])
+    out = w.to_dict()
+    assert out["boundaries"] == {"not_responsible_for": ["y"]}
+    # delegates_to absent because it was empty.
+    assert "delegates_to" not in out["boundaries"]

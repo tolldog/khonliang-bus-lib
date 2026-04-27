@@ -34,7 +34,14 @@ For testing::
 
 __version__ = "0.4.0"
 
-from khonliang_bus.agent import BaseAgent, Collaboration, Skill, handler
+from khonliang_bus.agent import (
+    BaseAgent,
+    Collaboration,
+    Skill,
+    Welcome,
+    WelcomeEntryPoint,
+    handler,
+)
 from khonliang_bus.client import BusClient, Message
 from khonliang_bus.versioning import add_version_flag, resolve_version
 from khonliang_bus.registry import (

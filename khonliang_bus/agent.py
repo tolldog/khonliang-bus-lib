@@ -232,6 +232,65 @@ class Collaboration:
     steps: list[dict[str, Any]] = field(default_factory=list)
 
 
+@dataclass
+class WelcomeEntryPoint:
+    """A canonical starting skill for a common cold-start path.
+
+    ``skill`` is the bus-skill name (matches a Skill registration on
+    this agent). ``when_to_use`` is a short phrase a cold-start LLM
+    can match against an incoming request.
+    """
+
+    skill: str
+    when_to_use: str
+
+
+@dataclass
+class Welcome:
+    """Editorial agent introduction for the cold-start ``welcome`` skill.
+
+    Subclasses populate this on the class via ``WELCOME = Welcome(...)``
+    so every cold-start LLM session calling ``welcome`` gets a
+    role-contextualized briefing without paying the LLM tokens to
+    derive it from skill descriptions alone. See
+    fr_khonliang-bus-lib_6a82732c.
+
+    All fields are optional; missing fields are omitted from the
+    welcome payload rather than producing placeholder text. An agent
+    with no Welcome override still answers welcome — it just returns
+    only the auto-derived fields (identity, version, skill catalog).
+    """
+
+    role: str = ""                                # 'development lifecycle authority'
+    mission: str = ""                             # one-paragraph editorial — why this agent exists
+    not_responsible_for: list[str] = field(default_factory=list)
+    delegates_to: dict[str, str] = field(default_factory=dict)  # {agent: reason}
+    entry_points: list[WelcomeEntryPoint] = field(default_factory=list)
+    guide_skill: str = ""                         # name of a deeper-context skill (e.g. 'developer_guide')
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        if self.role:
+            out["role"] = self.role
+        if self.mission:
+            out["mission"] = self.mission
+        if self.not_responsible_for or self.delegates_to:
+            boundaries: dict[str, Any] = {}
+            if self.not_responsible_for:
+                boundaries["not_responsible_for"] = list(self.not_responsible_for)
+            if self.delegates_to:
+                boundaries["delegates_to"] = dict(self.delegates_to)
+            out["boundaries"] = boundaries
+        if self.entry_points:
+            out["entry_points"] = [
+                {"skill": ep.skill, "when_to_use": ep.when_to_use}
+                for ep in self.entry_points
+            ]
+        if self.guide_skill:
+            out["guide_skill"] = self.guide_skill
+        return out
+
+
 # ---------------------------------------------------------------------------
 # Handler decorator
 # ---------------------------------------------------------------------------
@@ -322,7 +381,28 @@ class BaseAgent:
             description="Agent liveness + identity probe. Always available.",
             parameters={},
         ),
+        Skill(
+            name="welcome",
+            description=(
+                "Cold-start orientation: agent identity + role + mission "
+                "+ skill catalog grouped by category prefix. Call this "
+                "first to learn what this agent is for and where to "
+                "drill in. Always available."
+            ),
+            parameters={
+                "detail": {
+                    "type": "string",
+                    "default": "brief",
+                    "description": "compact (identity + role) | brief (+ entry points + skill counts) | full (+ all skill names by category)",
+                },
+            },
+        ),
     )
+
+    # Subclasses override this class attribute to provide editorial
+    # welcome content. The default is empty Welcome(); welcome() then
+    # returns only auto-derived fields. See fr_khonliang-bus-lib_6a82732c.
+    WELCOME: "Welcome" = Welcome()
 
     def _all_skills(self) -> list[Skill]:
         """Compose subclass skills with built-ins.
@@ -342,6 +422,86 @@ class BaseAgent:
             if s.name not in subclass_names
         ]
         return subclass_skills + extras
+
+    @handler("welcome")
+    async def handle_welcome(self, args: dict) -> dict:
+        """Return cold-start orientation: identity + role + skill catalog.
+
+        Auto-derived fields (always present): agent_id, agent_type,
+        version, skill_count, skill_categories. Editorial fields (only
+        when the subclass populates ``WELCOME``): role, mission,
+        boundaries, entry_points, guide_skill.
+
+        Detail levels:
+        - ``compact``: identity + role + skill_count.
+        - ``brief`` (default): + mission + boundaries + entry_points
+          + skill_categories (counts per category).
+        - ``full``: + skills_by_category (skill names grouped).
+
+        Skills are categorized by their name's first underscore-
+        separated prefix (e.g. ``git_*`` → ``git``, ``list_frs_local``
+        → ``list``). Skills without a clear prefix fall under ``misc``.
+        """
+        detail = str(args.get("detail", "brief")).strip().lower() or "brief"
+        if detail not in {"compact", "brief", "full"}:
+            return {"error": f"detail must be one of compact|brief|full (got {detail!r})"}
+
+        skills = self._all_skills()
+        categories = self._categorize_skills(skills)
+
+        out: dict[str, Any] = {
+            "agent_id": self.agent_id,
+            "agent_type": self.agent_type,
+            "version": self.version,
+            "skill_count": len(skills),
+        }
+
+        editorial = self.WELCOME.to_dict() if isinstance(self.WELCOME, Welcome) else {}
+        if "role" in editorial:
+            out["role"] = editorial["role"]
+
+        if detail == "compact":
+            return out
+
+        # brief + full: add editorial mission + boundaries + entry_points
+        for key in ("mission", "boundaries", "entry_points", "guide_skill"):
+            if key in editorial:
+                out[key] = editorial[key]
+
+        # brief: per-category counts
+        out["skill_categories"] = {
+            name: len(group) for name, group in categories.items()
+        }
+
+        if detail == "full":
+            out["skills_by_category"] = {
+                name: [s.name for s in group]
+                for name, group in categories.items()
+            }
+        return out
+
+    @staticmethod
+    def _categorize_skills(skills: list[Skill]) -> dict[str, list[Skill]]:
+        """Group skills by name prefix.
+
+        Heuristic: split on first underscore; the prefix is the
+        category. Skills with no underscore land in ``misc``. Built-in
+        skills (health_check, welcome) get their own category for
+        visibility — they're always present and shouldn't dilute a
+        domain category's count.
+        """
+        groups: dict[str, list[Skill]] = {}
+        builtin_names = {"health_check", "welcome"}
+        for s in sorted(skills, key=lambda x: x.name):
+            if s.name in builtin_names:
+                groups.setdefault("builtin", []).append(s)
+                continue
+            if "_" in s.name:
+                prefix = s.name.split("_", 1)[0]
+            else:
+                prefix = "misc"
+            groups.setdefault(prefix, []).append(s)
+        return dict(sorted(groups.items()))
 
     @handler("health_check")
     async def handle_health_check(self, args: dict) -> dict:

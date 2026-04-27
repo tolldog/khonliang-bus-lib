@@ -1223,6 +1223,35 @@ async def test_help_explicit_none_detail_aspect_use_defaults(aspect_agent):
     assert "aspect" not in result
 
 
+def test_skill_rejects_non_str_prompt():
+    """``prompt`` must be ``str`` (None coerces to ""). Other
+    types — bool, int, list, dict — fail loudly at construction
+    rather than serializing into the registration payload."""
+    for bad in (False, 42, ["wrong"], {"wrong": "shape"}):
+        with pytest.raises(TypeError) as exc_info:
+            Skill(name="x", prompt=bad)  # type: ignore[arg-type]
+        msg = str(exc_info.value)
+        assert "prompt" in msg
+        assert "str" in msg
+        assert type(bad).__name__ in msg
+
+
+def test_skill_rejects_non_list_aspect_values():
+    """List-aspects must be ``list`` (str gets the specific
+    character-splitting hint; everything else gets the generic
+    'expected list, got X' message). bool / dict / int are all
+    rejected — silent coercion would corrupt the registration
+    payload."""
+    for aspect in ("examples", "pairs_with", "not_appropriate_for"):
+        for bad in (False, 42, {"wrong": "shape"}):
+            with pytest.raises(TypeError) as exc_info:
+                Skill(name="x", **{aspect: bad})
+            msg = str(exc_info.value)
+            assert aspect in msg
+            assert "list" in msg
+            assert type(bad).__name__ in msg
+
+
 def test_skill_rejects_str_for_list_aspects_with_helpful_message():
     """A caller passing a string by mistake (common JSON/CLI shape)
     must fail loudly instead of getting silent character-splitting via

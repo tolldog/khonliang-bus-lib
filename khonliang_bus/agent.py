@@ -150,35 +150,55 @@ class Skill:
         self.authority = SkillAuthority.coerce(self.authority)
         self.status = SkillStatus.coerce(self.status)
         self.aliases = list(self.aliases)
-        # Aspect-field coercion: ``examples`` is deep-copied because
-        # each entry is a dict with nested ``input_args`` /
-        # ``expected_output_shape`` shapes — a shallow ``list(...)``
-        # would still alias the inner dicts to the caller's literals.
-        # The simpler list-of-strings aspects (``pairs_with``,
-        # ``not_appropriate_for``) only need a shallow copy of the outer
-        # list. ``None`` is coerced to an empty list / string so a
-        # caller passing JSON ``null`` for an unset aspect doesn't
-        # raise ``TypeError`` at construction.
+        # Aspect-field coercion. The type guards are deliberate: these
+        # fields ride the registration payload and surface through the
+        # ``help`` skill, so silent type drift (a stray ``False`` or
+        # ``{}``) would corrupt the discoverability output for every
+        # downstream consumer. Each guard fails loudly at construction
+        # rather than letting a misuse propagate.
         #
-        # Reject ``str`` explicitly: ``list("foo")`` silently splits
-        # into ``['f','o','o']`` (Python's iteration semantics for
-        # strings), which would corrupt a list-aspect with single-
-        # character entries instead of failing fast. Caller mistake
-        # we want surfaced loudly.
+        # ``prompt`` must be ``str`` (None coerces to "" — JSON null
+        # for an unset aspect).
         if self.prompt is None:
             self.prompt = ""
+        elif not isinstance(self.prompt, str):
+            raise TypeError(
+                f"Skill prompt must be a str (got "
+                f"{type(self.prompt).__name__}: {self.prompt!r})."
+            )
+
+        # List-aspects must be ``list`` (None coerces to []). ``str``
+        # gets a specific hint because ``list('foo')`` silently splits
+        # into ``['f','o','o']`` (the easy JSON / CLI mistake); every
+        # other non-list type is rejected as the generic "expected
+        # list, got X" case so dict / bool / int / etc. can't sneak
+        # through and silently coerce into a corrupt list-aspect.
         for aspect_name in ("examples", "pairs_with", "not_appropriate_for"):
             value = getattr(self, aspect_name)
+            if value is None:
+                setattr(self, aspect_name, [])
+                continue
             if isinstance(value, str):
                 raise TypeError(
                     f"Skill {aspect_name!r} must be a list (got str). "
                     f"Wrap a single entry in a list: {aspect_name}=[{value!r}]."
                 )
-        self.examples = deepcopy(list(self.examples)) if self.examples else []
-        self.pairs_with = list(self.pairs_with) if self.pairs_with else []
-        self.not_appropriate_for = (
-            list(self.not_appropriate_for) if self.not_appropriate_for else []
-        )
+            if not isinstance(value, list):
+                raise TypeError(
+                    f"Skill {aspect_name!r} must be a list (got "
+                    f"{type(value).__name__}: {value!r})."
+                )
+
+        # ``examples`` is deep-copied because each entry is a dict
+        # with nested ``input_args`` / ``expected_output_shape``
+        # shapes — a shallow copy would still alias the inner dicts
+        # to the caller's literals. The simpler list-of-strings
+        # aspects only need a shallow ``list(...)`` of the outer
+        # list. After the type guards above, empty lists round-trip
+        # cleanly through both calls (``deepcopy([]) == []``).
+        self.examples = deepcopy(self.examples)
+        self.pairs_with = list(self.pairs_with)
+        self.not_appropriate_for = list(self.not_appropriate_for)
         self.execution_profiles = [
             profile
             if isinstance(profile, ExecutionProfile)

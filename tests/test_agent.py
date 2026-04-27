@@ -1176,6 +1176,53 @@ async def test_help_rejects_non_list_skill_names(aspect_agent):
     assert "list" in result["error"]
 
 
+@pytest.mark.asyncio
+async def test_help_falsey_non_none_detail_hits_validation(aspect_agent):
+    """``detail=0`` / ``detail=False`` are caller-supplied bad values,
+    not "not provided" — they must hit the validation envelope rather
+    than silently coalesce to the default. Only ``None`` and missing
+    keys default to ``brief``."""
+    for bad in (0, False):
+        result = await aspect_agent._dispatch_request(
+            {"operation": "help", "args": {"skill_names": [], "detail": bad}}
+        )
+        assert "error" in result, f"falsey detail={bad!r} silently defaulted"
+        assert "compact|brief|full" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_help_falsey_non_none_aspect_hits_validation(aspect_agent):
+    """``aspect=0`` / ``aspect=False`` likewise must surface as bad
+    values rather than silently meaning "no aspect mode" (which is
+    what ``aspect=None`` / missing should do)."""
+    for bad in (0, False):
+        result = await aspect_agent._dispatch_request(
+            {"operation": "help", "args": {"skill_names": [], "aspect": bad}}
+        )
+        assert "error" in result, f"falsey aspect={bad!r} silently defaulted"
+        # Validation envelope lists the accepted aspects.
+        assert "prompt" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_help_explicit_none_detail_aspect_use_defaults(aspect_agent):
+    """``detail=None`` and ``aspect=None`` (JSON null) are the
+    legitimate "not provided" sentinel — they must default to the
+    schema-declared defaults (brief / no-aspect-mode) rather than
+    raising."""
+    result = await aspect_agent._dispatch_request(
+        {
+            "operation": "help",
+            "args": {"skill_names": [], "detail": None, "aspect": None},
+        }
+    )
+    assert "error" not in result
+    # Brief mode response shape — has the SkillEntry list, no
+    # "aspect" envelope key.
+    assert "skills" in result
+    assert "aspect" not in result
+
+
 def test_skill_rejects_str_for_list_aspects_with_helpful_message():
     """A caller passing a string by mistake (common JSON/CLI shape)
     must fail loudly instead of getting silent character-splitting via

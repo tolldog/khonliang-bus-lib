@@ -829,11 +829,26 @@ class BaseAgent:
             }
         skill_names = [str(n) for n in raw_names]
 
-        detail = str(args.get("detail") or "brief").strip().lower() or "brief"
+        # Defaulting: only treat ``None`` as "not provided". Falsey
+        # values like ``0`` / ``False`` are caller-supplied bad values
+        # and should hit the validation envelope below — falsey-coalesce
+        # would silently substitute the default and mask the bug. The
+        # post-strip ``or default`` is narrow: only kicks in when the
+        # caller passed an explicit empty/whitespace string, matching
+        # ``handle_welcome``'s convention.
+        raw_detail = args.get("detail")
+        if raw_detail is None:
+            detail = "brief"
+        else:
+            detail = str(raw_detail).strip().lower() or "brief"
         if detail not in {"compact", "brief", "full"}:
             return {"error": f"detail must be one of compact|brief|full (got {detail!r})"}
 
-        aspect = str(args.get("aspect") or "").strip().lower()
+        raw_aspect = args.get("aspect")
+        if raw_aspect is None:
+            aspect = ""
+        else:
+            aspect = str(raw_aspect).strip().lower()
         if aspect and aspect not in self._ASPECT_FIELDS:
             allowed = "|".join(sorted(self._ASPECT_FIELDS))
             return {"error": f"aspect must be one of {allowed} (got {aspect!r})"}

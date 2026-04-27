@@ -6,7 +6,14 @@ import asyncio
 
 import pytest
 
-from khonliang_bus import BaseAgent, Skill, Collaboration, handler
+from khonliang_bus import (
+    BaseAgent,
+    Collaboration,
+    Skill,
+    Welcome,
+    WelcomeEntryPoint,
+    handler,
+)
 
 
 class EchoAgent(BaseAgent):
@@ -75,8 +82,9 @@ def test_collaborations_registered(agent):
 # -- handlers --
 
 def test_handlers_collected(agent):
-    # EchoAgent declares echo/upper/fail; health_check comes for free from BaseAgent.
-    assert set(agent._handlers) == {"echo", "upper", "fail", "health_check"}
+    # EchoAgent declares echo/upper/fail; health_check + welcome come for
+    # free from BaseAgent's BUILT_IN_SKILLS.
+    assert set(agent._handlers) == {"echo", "upper", "fail", "health_check", "welcome"}
 
 
 @pytest.mark.asyncio
@@ -220,17 +228,17 @@ class BareAgent(BaseAgent):
     version = "1.0.0"
 
 
-def test_bare_agent_advertises_health_check():
-    """An agent with no skills of its own still gets health_check."""
+def test_bare_agent_advertises_builtins():
+    """An agent with no skills of its own still gets the built-ins."""
     a = BareAgent(agent_id="bare", bus_url="http://localhost:9999")
     names = {s.name for s in a._all_skills()}
-    assert names == {"health_check"}
+    assert names == {"health_check", "welcome"}
 
 
-def test_subclass_skills_augmented_with_health_check(agent):
-    """Subclass skills + built-in health_check are merged."""
+def test_subclass_skills_augmented_with_builtins(agent):
+    """Subclass skills + built-in health_check + welcome are merged."""
     names = {s.name for s in agent._all_skills()}
-    assert names == {"echo", "upper", "fail", "health_check"}
+    assert names == {"echo", "upper", "fail", "health_check", "welcome"}
 
 
 def test_register_skills_unchanged_by_builtins(agent):
@@ -561,3 +569,326 @@ def test_skill_default_timeout_s_rejects_bool():
     avoid an author typo silently becoming a 1-second timeout."""
     with pytest.raises(TypeError, match="default_timeout_s"):
         Skill("bad", default_timeout_s=True)
+
+
+# ---------------------------------------------------------------------------
+# welcome (fr_khonliang-bus-lib_6a82732c)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_welcome_default_brief_announces_undocumented(agent):
+    """Bare agent (no WELCOME override) returns a 'please document me'
+    fallback: identity + auto-derived skill catalog + explicit
+    missing-doc markers and a checklist of agent-level fields that
+    need filling."""
+    result = await agent._dispatch_request({"operation": "welcome", "args": {}})
+    assert result["agent_id"] == "echo-test"
+    assert result["agent_type"] == "echo"
+    assert result["version"] == "0.2.0"
+    assert result["skill_count"] == 5  # echo, upper, fail, health_check, welcome
+    # Synthesized fallback editorial — the lib announces the undocumented
+    # state instead of returning a sparse silent response.
+    assert result["role"].startswith("(undocumented agent")
+    assert "WELCOME" in result["mission"]
+    assert "fr_khonliang-bus-lib_6a82732c" in result["mission"]
+    # Agent-level checklist: every editorial field that should be filled.
+    assert result["documentation_gaps"] == [
+        "role",
+        "mission",
+        "boundaries (not_responsible_for + delegates_to)",
+        "entry_points",
+        "guide_skill",
+    ]
+    # No editorial sub-keys — these would mean the agent IS documented.
+    assert "boundaries" not in result
+    assert "entry_points" not in result
+    # Categories still present at brief detail.
+    assert "skill_categories" in result
+    # health_check + welcome are the builtin category.
+    assert result["skill_categories"]["builtin"] == 2
+
+
+@pytest.mark.asyncio
+async def test_welcome_default_compact_keeps_role_marker(agent):
+    """compact still returns the missing-doc role marker so even the
+    cheapest welcome variant tells the consumer the agent is
+    undocumented; mission / categories / gaps stay absent at compact."""
+    result = await agent._dispatch_request(
+        {"operation": "welcome", "args": {"detail": "compact"}}
+    )
+    assert result["role"].startswith("(undocumented agent")
+    assert "skill_categories" not in result
+    assert "skills_by_category" not in result
+    assert "mission" not in result
+    assert "documentation_gaps" not in result
+    assert "skill_documentation_gaps" not in result
+    assert result["skill_count"] == 5
+
+
+@pytest.mark.asyncio
+async def test_welcome_default_full_lists_per_skill_documentation_gaps(agent):
+    """At full detail, undocumented agents emit a per-skill gap map so
+    a documenting LLM can target each skill's missing fields."""
+    result = await agent._dispatch_request(
+        {"operation": "welcome", "args": {"detail": "full"}}
+    )
+    gaps_by_skill = result["skill_documentation_gaps"]
+    # ``upper`` and ``fail`` were registered without parameters → they
+    # flag both "parameters / input_schema not declared" and
+    # "capability tag not set"; ``echo`` only flags capability.
+    assert "parameters / input_schema not declared" in gaps_by_skill["upper"]
+    assert "capability tag not set" in gaps_by_skill["upper"]
+    assert "capability tag not set" in gaps_by_skill["echo"]
+    # ``echo`` HAS parameters, so no parameters-gap entry.
+    assert "parameters / input_schema not declared" not in gaps_by_skill["echo"]
+    # Built-ins also surface so the lib's own undocumented surface is
+    # visible — operators see what THEY would need to populate to make
+    # the platform fully self-documenting.
+    assert "health_check" in gaps_by_skill
+    assert "welcome" in gaps_by_skill
+
+
+@pytest.mark.asyncio
+async def test_welcome_full_lists_skills_per_category(agent):
+    """full detail enumerates skill names per category."""
+    result = await agent._dispatch_request(
+        {"operation": "welcome", "args": {"detail": "full"}}
+    )
+    assert "skills_by_category" in result
+    cats = result["skills_by_category"]
+    # echo / upper / fail have no underscore prefix → 'misc'.
+    assert set(cats["misc"]) == {"echo", "upper", "fail"}
+    # builtins are in their own bucket.
+    assert set(cats["builtin"]) == {"health_check", "welcome"}
+
+
+@pytest.mark.asyncio
+async def test_welcome_invalid_detail_returns_error(agent):
+    result = await agent._dispatch_request(
+        {"operation": "welcome", "args": {"detail": "bogus"}}
+    )
+    assert "error" in result
+    assert "compact|brief|full" in result["error"]
+
+
+# -- editorial WELCOME override --
+
+
+class CuratedAgent(BaseAgent):
+    """Agent with a populated WELCOME override."""
+
+    agent_type = "curated"
+    module_name = "tests.test_agent"
+    version = "1.0.0"
+
+    WELCOME = Welcome(
+        role="curated test agent",
+        mission="Demonstrates the editorial fields surfaced via welcome.",
+        not_responsible_for=["paper ingestion (researcher)"],
+        delegates_to={"researcher": "evidence/context only"},
+        entry_points=[
+            WelcomeEntryPoint(skill="curated_action", when_to_use="for curated workflows"),
+        ],
+        guide_skill="curated_guide",
+    )
+
+    def register_skills(self):
+        return [
+            Skill("curated_action", "Run a curated workflow"),
+            Skill("curated_guide", "Curated workflow guide"),
+            Skill("git_status", "Stub git skill — exercises category prefix"),
+        ]
+
+
+@pytest.mark.asyncio
+async def test_welcome_brief_includes_editorial_fields():
+    a = CuratedAgent(agent_id="cur", bus_url="http://localhost:9999")
+    result = await a._dispatch_request({"operation": "welcome", "args": {}})
+    assert result["role"] == "curated test agent"
+    assert result["mission"].startswith("Demonstrates")
+    assert result["boundaries"]["not_responsible_for"] == ["paper ingestion (researcher)"]
+    assert result["boundaries"]["delegates_to"] == {"researcher": "evidence/context only"}
+    assert result["entry_points"] == [
+        {"skill": "curated_action", "when_to_use": "for curated workflows"}
+    ]
+    assert result["guide_skill"] == "curated_guide"
+
+
+@pytest.mark.asyncio
+async def test_welcome_compact_keeps_role_drops_mission():
+    a = CuratedAgent(agent_id="cur", bus_url="http://localhost:9999")
+    result = await a._dispatch_request(
+        {"operation": "welcome", "args": {"detail": "compact"}}
+    )
+    # compact: keep role for context, drop the longer-form fields.
+    assert result["role"] == "curated test agent"
+    assert "mission" not in result
+    assert "boundaries" not in result
+    assert "entry_points" not in result
+    assert "skill_categories" not in result
+
+
+@pytest.mark.asyncio
+async def test_welcome_categorizes_by_underscore_prefix():
+    """Skills with an underscore prefix go to that category bucket."""
+    a = CuratedAgent(agent_id="cur", bus_url="http://localhost:9999")
+    result = await a._dispatch_request(
+        {"operation": "welcome", "args": {"detail": "full"}}
+    )
+    cats = result["skills_by_category"]
+    # 'curated_action' / 'curated_guide' → 'curated' bucket.
+    assert set(cats["curated"]) == {"curated_action", "curated_guide"}
+    # 'git_status' → 'git' bucket.
+    assert cats["git"] == ["git_status"]
+    # builtins separately.
+    assert set(cats["builtin"]) == {"health_check", "welcome"}
+
+
+def test_welcome_dataclass_to_dict_drops_empty_fields():
+    """An empty Welcome serializes to {} so welcome's auto-derived
+    fields are the only ones present."""
+    assert Welcome().to_dict() == {}
+
+
+def test_welcome_dataclass_to_dict_drops_individually_empty_fields():
+    """Partial population: only populated fields appear."""
+    w = Welcome(role="x")
+    assert w.to_dict() == {"role": "x"}
+
+
+def test_welcome_dataclass_collapses_boundaries():
+    """boundaries dict only appears if at least one of its sub-fields is set."""
+    w = Welcome(role="x", not_responsible_for=["y"])
+    out = w.to_dict()
+    assert out["boundaries"] == {"not_responsible_for": ["y"]}
+    # delegates_to absent because it was empty.
+    assert "delegates_to" not in out["boundaries"]
+
+
+@pytest.mark.asyncio
+async def test_welcome_detail_none_treated_as_default(agent):
+    """JSON null / Python None for ``detail`` should fall back to the
+    default rather than coerce to the string 'none' (which would fail
+    the compact|brief|full check)."""
+    result = await agent._dispatch_request(
+        {"operation": "welcome", "args": {"detail": None}}
+    )
+    # No error; same shape as the default brief response.
+    assert "error" not in result
+    assert result["skill_count"] == 5
+    assert "skill_categories" in result
+
+
+def test_welcome_dataclass_is_frozen():
+    """frozen=True catches the common 'mutate the shared default' error
+    (welcome.role = 'x' raises FrozenInstanceError)."""
+    import dataclasses
+    w = Welcome(role="x")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        w.role = "y"
+
+
+def test_welcome_entry_point_is_frozen():
+    import dataclasses
+    ep = WelcomeEntryPoint(skill="x", when_to_use="y")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        ep.skill = "z"
+
+
+def test_welcome_collections_are_immutable_after_construction():
+    """Callers may pass list/dict literals for convenience, but the
+    stored fields are coerced to truly-immutable shapes (tuple /
+    MappingProxyType). Mutating the original literals doesn't leak
+    into the Welcome instance, and the stored collections themselves
+    cannot be mutated in place — addressing the shared-default
+    leakage class structurally rather than via convention."""
+    from types import MappingProxyType
+
+    src_list = ["paper ingestion (researcher)"]
+    src_dict = {"researcher": "evidence/context only"}
+    src_eps = [WelcomeEntryPoint(skill="x", when_to_use="y")]
+    w = Welcome(
+        not_responsible_for=src_list,
+        delegates_to=src_dict,
+        entry_points=src_eps,
+    )
+    assert isinstance(w.not_responsible_for, tuple)
+    assert isinstance(w.delegates_to, MappingProxyType)
+    assert isinstance(w.entry_points, tuple)
+
+    # Mutating the original literals after construction must not bleed
+    # into ``w`` — coercion is by-value.
+    src_list.append("leaked")
+    src_dict["new"] = "leaked"
+    src_eps.append(WelcomeEntryPoint(skill="leaked", when_to_use="leaked"))
+    assert w.not_responsible_for == ("paper ingestion (researcher)",)
+    assert dict(w.delegates_to) == {"researcher": "evidence/context only"}
+    assert len(w.entry_points) == 1
+
+    # Direct mutation of the stored collections fails.
+    with pytest.raises((AttributeError, TypeError)):
+        w.not_responsible_for.append("x")  # type: ignore[attr-defined]
+    with pytest.raises(TypeError):
+        w.delegates_to["new"] = "x"  # type: ignore[index]
+    with pytest.raises((AttributeError, TypeError)):
+        w.entry_points.append(  # type: ignore[attr-defined]
+            WelcomeEntryPoint(skill="x", when_to_use="y")
+        )
+
+
+def test_welcome_rewraps_existing_mappingproxy_to_sever_caller_alias():
+    """If the caller passes a ``MappingProxyType`` that wraps a dict
+    they still hold, ``__post_init__`` must copy + re-wrap so later
+    mutation of the caller's backing dict doesn't bleed into the
+    frozen Welcome."""
+    from types import MappingProxyType
+
+    backing = {"researcher": "evidence/context only"}
+    caller_proxy = MappingProxyType(backing)
+    w = Welcome(delegates_to=caller_proxy)
+
+    backing["leaked"] = "should not appear"
+    assert "leaked" not in w.delegates_to
+    assert dict(w.delegates_to) == {"researcher": "evidence/context only"}
+
+
+@pytest.mark.asyncio
+async def test_welcome_handles_null_args_cleanly(agent):
+    """``args=None`` (transport-level glitch / JSON null) must not
+    raise — returns the same shape as an empty args dict."""
+    result = await agent._dispatch_request(
+        {"operation": "welcome", "args": None}
+    )
+    assert "error" not in result
+    assert result["agent_id"] == "echo-test"
+    assert result["skill_count"] == 5
+
+
+@pytest.mark.asyncio
+async def test_welcome_rejects_non_dict_args(agent):
+    """A non-dict / non-None args produces a clean validation error
+    instead of an AttributeError leaking as a transport failure."""
+    result = await agent._dispatch_request(
+        {"operation": "welcome", "args": ["unexpected", "list"]}
+    )
+    assert "error" in result
+    assert "object" in result["error"]
+
+
+def test_skill_doc_gaps_flags_missing_fields():
+    """The per-skill gap helper reports description / parameters /
+    capability gaps independently."""
+    fully_documented = Skill(
+        name="x",
+        description="does the thing",
+        parameters={"q": {"type": "string"}},
+        capability="x.do",
+    )
+    assert BaseAgent._skill_doc_gaps(fully_documented) == []
+
+    bare = Skill(name="y")
+    gaps = BaseAgent._skill_doc_gaps(bare)
+    assert "description is empty" in gaps
+    assert "parameters / input_schema not declared" in gaps
+    assert "capability tag not set" in gaps

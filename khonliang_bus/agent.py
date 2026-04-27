@@ -38,7 +38,8 @@ import signal
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from types import MappingProxyType
+from typing import Any, Callable, Mapping
 
 import httpx
 
@@ -121,8 +122,16 @@ class Skill:
     default_timeout_s: float | None = None
 
     def __post_init__(self) -> None:
-        self.parameters = dict(self.parameters)
-        self.input_schema = dict(self.input_schema or self.parameters)
+        # Deep-copy so per-parameter nested dicts (type/default/description
+        # objects, JSON-schema sub-trees) don't alias across Skill clones.
+        # ``_all_skills`` rebuilds built-ins via ``Skill(**s.to_dict())``;
+        # without deepcopy, a caller mutating ``params['detail']['default']``
+        # on one clone would silently corrupt ``BUILT_IN_SKILLS`` for every
+        # subsequent call (and every other agent in the process).
+        from copy import deepcopy
+
+        self.parameters = deepcopy(dict(self.parameters))
+        self.input_schema = deepcopy(dict(self.input_schema or self.parameters))
         if self.output_contract is not None:
             self.output_contract = (
                 self.output_contract
@@ -232,6 +241,107 @@ class Collaboration:
     steps: list[dict[str, Any]] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class WelcomeEntryPoint:
+    """A canonical starting skill for a common cold-start path.
+
+    ``skill`` is the bus-skill name (matches a Skill registration on
+    this agent). ``when_to_use`` is a short phrase a cold-start LLM
+    can match against an incoming request.
+
+    Frozen so accidental ``ep.skill = "..."`` reassignment fails
+    fast — see Welcome's class doc for the broader invariant.
+    """
+
+    skill: str
+    when_to_use: str
+
+
+_EMPTY_DELEGATES: Mapping[str, str] = MappingProxyType({})
+
+
+@dataclass(frozen=True)
+class Welcome:
+    """Editorial agent introduction for the cold-start ``welcome`` skill.
+
+    Subclasses populate this on the class via ``WELCOME = Welcome(...)``
+    so every cold-start LLM session calling ``welcome`` gets a
+    role-contextualized briefing without paying the LLM tokens to
+    derive it from skill descriptions alone. See
+    fr_khonliang-bus-lib_6a82732c.
+
+    All fields are optional; missing fields are omitted from the
+    welcome payload rather than producing placeholder text. An agent
+    with no Welcome override still answers welcome — ``handle_welcome``
+    detects the empty default and synthesizes an explicit
+    "this agent is undocumented" response from the auto-derived
+    skill catalog (see ``BaseAgent.handle_welcome``).
+
+    Immutability: ``frozen=True`` blocks attribute reassignment, and
+    ``__post_init__`` coerces the collection fields to truly immutable
+    shapes (tuple / MappingProxyType). A shared default Welcome — even
+    one accidentally aliased across multiple agents in the same
+    process — cannot be mutated in place. Callers may still pass
+    ordinary list / dict literals; the coercion happens at
+    construction.
+    """
+
+    role: str = ""                                # 'development lifecycle authority'
+    mission: str = ""                             # one-paragraph editorial — why this agent exists
+    not_responsible_for: tuple[str, ...] = ()
+    delegates_to: Mapping[str, str] = field(default_factory=lambda: _EMPTY_DELEGATES)
+    entry_points: tuple[WelcomeEntryPoint, ...] = ()
+    guide_skill: str = ""                         # name of a deeper-context skill (e.g. 'developer_guide')
+
+    def __post_init__(self) -> None:
+        # Coerce to immutable shapes regardless of what the caller
+        # passed. ``object.__setattr__`` is the standard frozen-dataclass
+        # idiom — direct ``self.x = ...`` would raise FrozenInstanceError.
+        #
+        # Always re-wrap ``delegates_to``: even when the caller passes an
+        # existing ``MappingProxyType``, that proxy may wrap a mutable
+        # dict the caller still holds — mutating that backing dict would
+        # leak into the frozen Welcome. Copying via ``dict(...)`` then
+        # rewrapping severs the reference.
+        object.__setattr__(
+            self,
+            "not_responsible_for",
+            tuple(self.not_responsible_for),
+        )
+        object.__setattr__(
+            self,
+            "delegates_to",
+            MappingProxyType(dict(self.delegates_to)),
+        )
+        object.__setattr__(
+            self,
+            "entry_points",
+            tuple(self.entry_points),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        if self.role:
+            out["role"] = self.role
+        if self.mission:
+            out["mission"] = self.mission
+        if self.not_responsible_for or self.delegates_to:
+            boundaries: dict[str, Any] = {}
+            if self.not_responsible_for:
+                boundaries["not_responsible_for"] = list(self.not_responsible_for)
+            if self.delegates_to:
+                boundaries["delegates_to"] = dict(self.delegates_to)
+            out["boundaries"] = boundaries
+        if self.entry_points:
+            out["entry_points"] = [
+                {"skill": ep.skill, "when_to_use": ep.when_to_use}
+                for ep in self.entry_points
+            ]
+        if self.guide_skill:
+            out["guide_skill"] = self.guide_skill
+        return out
+
+
 # ---------------------------------------------------------------------------
 # Handler decorator
 # ---------------------------------------------------------------------------
@@ -322,7 +432,41 @@ class BaseAgent:
             description="Agent liveness + identity probe. Always available.",
             parameters={},
         ),
+        Skill(
+            name="welcome",
+            description=(
+                "Cold-start orientation: agent identity + role + mission "
+                "+ skill catalog grouped by category prefix. Call this "
+                "first to learn what this agent is for and where to "
+                "drill in. Always available."
+            ),
+            parameters={
+                "detail": {
+                    "type": "string",
+                    "default": "brief",
+                    "description": (
+                        "compact (identity + version + skill_count + "
+                        "role) | brief (+ mission + boundaries + "
+                        "entry_points + skill_categories — when the "
+                        "agent populates WELCOME; otherwise the "
+                        "fallback emits documentation_gaps and a "
+                        "synthesized missing-doc role/mission) | full "
+                        "(+ skills_by_category, plus "
+                        "skill_documentation_gaps for undocumented "
+                        "agents)"
+                    ),
+                },
+            },
+        ),
     )
+
+    # Subclasses override this class attribute to provide editorial
+    # welcome content. The default is empty Welcome(); ``handle_welcome``
+    # detects the empty case and synthesizes a "this agent is
+    # undocumented — here is what we know, please document" response
+    # from the auto-derived skill catalog. See
+    # fr_khonliang-bus-lib_6a82732c.
+    WELCOME: "Welcome" = Welcome()
 
     def _all_skills(self) -> list[Skill]:
         """Compose subclass skills with built-ins.
@@ -342,6 +486,212 @@ class BaseAgent:
             if s.name not in subclass_names
         ]
         return subclass_skills + extras
+
+    @handler("welcome")
+    async def handle_welcome(self, args: Any) -> dict:
+        """Return cold-start orientation: identity + role + skill catalog.
+
+        Auto-derived fields always present: agent_id, agent_type,
+        version, skill_count. ``skill_categories`` is added at
+        ``brief``+ detail; ``skills_by_category`` is added at ``full``
+        only. Editorial fields (only when the subclass populates
+        ``WELCOME``): role, mission, boundaries, entry_points,
+        guide_skill.
+
+        Detail levels:
+        - ``compact``: identity + role + skill_count.
+        - ``brief`` (default): + mission + boundaries + entry_points
+          + skill_categories (counts per category).
+        - ``full``: brief + skills_by_category (skill names grouped).
+
+        Skills are categorized by their name's first underscore-
+        separated prefix (e.g. ``git_*`` → ``git``, ``list_frs_local``
+        → ``list``). Skills without a clear prefix fall under ``misc``.
+        Built-ins (``health_check``, ``welcome``) get their own
+        ``builtin`` bucket.
+
+        Undocumented-agent fallback: when ``WELCOME`` is the empty
+        bus-lib default (subclass forgot to populate), the response
+        substitutes synthesized ``role`` / ``mission`` markers
+        announcing the missing editorial, plus a
+        ``documentation_gaps`` list of agent-level fields that need
+        filling and a ``skill_documentation_gaps`` map of per-skill
+        gaps (full detail). The agent stays callable; the cold-start
+        LLM can see what's there, what's missing, and ask for the
+        agent / skills to be documented.
+        """
+        # Normalize ``args``: a transport-level glitch could deliver
+        # ``args=None`` or a non-dict (e.g. a JSON ``null`` or list).
+        # Returning a clean validation error is friendlier than letting
+        # ``AttributeError: 'NoneType' object has no attribute 'get'``
+        # bubble up through the bus as a transport failure.
+        if args is None:
+            args = {}
+        elif not isinstance(args, dict):
+            return {
+                "error": (
+                    f"args must be an object (got {type(args).__name__})"
+                )
+            }
+        # ``args.get("detail")`` may return None (caller passed
+        # ``{"detail": null}``); treat that as "not provided" and fall
+        # back to the default rather than coercing to the string
+        # ``'none'`` — which would produce a confusing "detail must be
+        # one of …" error for what's effectively a missing arg.
+        raw_detail = args.get("detail")
+        if raw_detail is None:
+            detail = "brief"
+        else:
+            detail = str(raw_detail).strip().lower() or "brief"
+        if detail not in {"compact", "brief", "full"}:
+            return {"error": f"detail must be one of compact|brief|full (got {detail!r})"}
+
+        skills = self._all_skills()
+
+        out: dict[str, Any] = {
+            "agent_id": self.agent_id,
+            "agent_type": self.agent_type,
+            "version": self.version,
+            "skill_count": len(skills),
+        }
+
+        # Refuse silently-dropped editorial: a subclass that sets
+        # WELCOME to anything other than a Welcome instance is a
+        # programmer error and should fail loudly, not produce a
+        # response missing role / mission / entry_points without
+        # explanation.
+        if not isinstance(self.WELCOME, Welcome):
+            raise TypeError(
+                f"{type(self).__name__}.WELCOME must be a Welcome instance "
+                f"(got {type(self.WELCOME).__name__}). Replace the class "
+                f"attribute with WELCOME = Welcome(...)."
+            )
+        editorial = self.WELCOME.to_dict()
+        is_undocumented = not editorial
+
+        if is_undocumented:
+            out["role"] = (
+                "(undocumented agent — WELCOME not populated)"
+            )
+        elif "role" in editorial:
+            out["role"] = editorial["role"]
+
+        if detail == "compact":
+            return out
+
+        # Categorize only when the response will actually use it
+        # (brief / full); compact returns above without paying the
+        # sort + group cost.
+        categories = self._categorize_skills(skills)
+
+        if is_undocumented:
+            out["mission"] = (
+                "This agent has not declared a WELCOME editorial. "
+                "The skill catalog below shows what it CAN do, but "
+                "role / mission / boundaries / entry_points / "
+                "guide_skill are unset. Populate "
+                "``WELCOME = Welcome(role=..., mission=..., "
+                "entry_points=[...])`` on the agent class so cold-"
+                "start LLM sessions can orient without reading "
+                "source. See fr_khonliang-bus-lib_6a82732c. Per-"
+                "skill documentation gaps are listed at "
+                "``detail=full``; please fill in any skill that "
+                "appears there."
+            )
+            out["documentation_gaps"] = self._welcome_doc_gaps()
+        else:
+            # brief + full: add editorial mission + boundaries + entry_points
+            for key in ("mission", "boundaries", "entry_points", "guide_skill"):
+                if key in editorial:
+                    out[key] = editorial[key]
+
+        # brief: per-category counts
+        out["skill_categories"] = {
+            name: len(group) for name, group in categories.items()
+        }
+
+        if detail == "full":
+            out["skills_by_category"] = {
+                name: [s.name for s in group]
+                for name, group in categories.items()
+            }
+            if is_undocumented:
+                gaps_by_skill = {
+                    s.name: gaps
+                    for s in skills
+                    for gaps in (self._skill_doc_gaps(s),)
+                    if gaps
+                }
+                if gaps_by_skill:
+                    out["skill_documentation_gaps"] = gaps_by_skill
+        return out
+
+    @staticmethod
+    def _welcome_doc_gaps() -> list[str]:
+        """Agent-level WELCOME fields that should be populated.
+
+        Returned verbatim in the fallback response so a tooling
+        consumer (or a documenting LLM) can build a checklist
+        without parsing prose. Order mirrors how the editorial
+        fields appear in a populated response: orientation first
+        (role, mission), then boundaries, then routing
+        (entry_points, guide_skill).
+        """
+        return [
+            "role",
+            "mission",
+            "boundaries (not_responsible_for + delegates_to)",
+            "entry_points",
+            "guide_skill",
+        ]
+
+    @staticmethod
+    def _skill_doc_gaps(skill: Skill) -> list[str]:
+        """Per-skill documentation gaps.
+
+        Reports what's missing so cold-start consumers know which
+        skills lack the editorial they'd need to call them
+        confidently. Empty list = fully documented; the caller
+        omits skills with zero gaps from the response.
+        """
+        gaps: list[str] = []
+        if not skill.description.strip():
+            gaps.append("description is empty")
+        if not skill.parameters and not skill.input_schema:
+            gaps.append("parameters / input_schema not declared")
+        if not skill.capability:
+            gaps.append("capability tag not set")
+        return gaps
+
+    @classmethod
+    def _categorize_skills(cls, skills: list[Skill]) -> dict[str, list[Skill]]:
+        """Group skills by name prefix.
+
+        Heuristic: split on first underscore; the prefix is the
+        category. Skills with no underscore land in ``misc``. Built-in
+        skills (derived from ``BUILT_IN_SKILLS``) get their own
+        ``builtin`` bucket for visibility — they're always present and
+        shouldn't dilute a domain category's count. Sourcing the names
+        from the tuple keeps this in lock-step with whatever the agent
+        actually treats as a built-in.
+
+        ``classmethod`` (not ``staticmethod``) so the lookup of
+        ``cls.BUILT_IN_SKILLS`` honors any subclass override of the
+        tuple — a subclass that adds a built-in via tuple extension
+        gets it bucketed correctly without overriding this method.
+        """
+        groups: dict[str, list[Skill]] = {}
+        builtin_names = {s.name for s in cls.BUILT_IN_SKILLS}
+        for s in sorted(skills, key=lambda x: x.name):
+            if s.name in builtin_names:
+                groups.setdefault("builtin", []).append(s)
+                continue
+            if "_" in s.name:
+                prefix = s.name.split("_", 1)[0]
+            else:
+                prefix = "misc"
+            groups.setdefault(prefix, []).append(s)
+        return dict(sorted(groups.items()))
 
     @handler("health_check")
     async def handle_health_check(self, args: dict) -> dict:

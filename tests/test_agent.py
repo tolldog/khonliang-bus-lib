@@ -725,3 +725,33 @@ def test_welcome_dataclass_collapses_boundaries():
     assert out["boundaries"] == {"not_responsible_for": ["y"]}
     # delegates_to absent because it was empty.
     assert "delegates_to" not in out["boundaries"]
+
+
+@pytest.mark.asyncio
+async def test_welcome_detail_none_treated_as_default(agent):
+    """JSON null / Python None for ``detail`` should fall back to the
+    default rather than coerce to the string 'none' (which would fail
+    the compact|brief|full check)."""
+    result = await agent._dispatch_request(
+        {"operation": "welcome", "args": {"detail": None}}
+    )
+    # No error; same shape as the default brief response.
+    assert "error" not in result
+    assert result["skill_count"] == 5
+    assert "skill_categories" in result
+
+
+def test_welcome_dataclass_is_frozen():
+    """frozen=True catches the common 'mutate the shared default' error
+    (welcome.role = 'x' raises FrozenInstanceError)."""
+    import dataclasses
+    w = Welcome(role="x")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        w.role = "y"
+
+
+def test_welcome_entry_point_is_frozen():
+    import dataclasses
+    ep = WelcomeEntryPoint(skill="x", when_to_use="y")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        ep.skill = "z"

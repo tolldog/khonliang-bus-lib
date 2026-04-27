@@ -232,20 +232,23 @@ class Collaboration:
     steps: list[dict[str, Any]] = field(default_factory=list)
 
 
-@dataclass
+@dataclass(frozen=True)
 class WelcomeEntryPoint:
     """A canonical starting skill for a common cold-start path.
 
     ``skill`` is the bus-skill name (matches a Skill registration on
     this agent). ``when_to_use`` is a short phrase a cold-start LLM
     can match against an incoming request.
+
+    Frozen so accidental ``ep.skill = "..."`` reassignment fails
+    fast — see Welcome's class doc for the broader invariant.
     """
 
     skill: str
     when_to_use: str
 
 
-@dataclass
+@dataclass(frozen=True)
 class Welcome:
     """Editorial agent introduction for the cold-start ``welcome`` skill.
 
@@ -259,6 +262,15 @@ class Welcome:
     welcome payload rather than producing placeholder text. An agent
     with no Welcome override still answers welcome — it just returns
     only the auto-derived fields (identity, version, skill catalog).
+
+    Mutability invariant: the dataclass itself is frozen, but the
+    ``not_responsible_for`` / ``delegates_to`` / ``entry_points``
+    collections are still concrete list / dict / list — they could
+    technically be mutated in-place. **Subclasses must replace the
+    entire WELCOME class attribute via ``WELCOME = Welcome(...)``,
+    not mutate fields on the inherited default**. The frozen=True
+    above catches the most common mistake (attribute reassignment);
+    convention catches the rest.
     """
 
     role: str = ""                                # 'development lifecycle authority'
@@ -427,22 +439,35 @@ class BaseAgent:
     async def handle_welcome(self, args: dict) -> dict:
         """Return cold-start orientation: identity + role + skill catalog.
 
-        Auto-derived fields (always present): agent_id, agent_type,
-        version, skill_count, skill_categories. Editorial fields (only
-        when the subclass populates ``WELCOME``): role, mission,
-        boundaries, entry_points, guide_skill.
+        Auto-derived fields always present: agent_id, agent_type,
+        version, skill_count. ``skill_categories`` is added at
+        ``brief``+ detail; ``skills_by_category`` is added at ``full``
+        only. Editorial fields (only when the subclass populates
+        ``WELCOME``): role, mission, boundaries, entry_points,
+        guide_skill.
 
         Detail levels:
         - ``compact``: identity + role + skill_count.
         - ``brief`` (default): + mission + boundaries + entry_points
           + skill_categories (counts per category).
-        - ``full``: + skills_by_category (skill names grouped).
+        - ``full``: brief + skills_by_category (skill names grouped).
 
         Skills are categorized by their name's first underscore-
         separated prefix (e.g. ``git_*`` → ``git``, ``list_frs_local``
         → ``list``). Skills without a clear prefix fall under ``misc``.
+        Built-ins (``health_check``, ``welcome``) get their own
+        ``builtin`` bucket.
         """
-        detail = str(args.get("detail", "brief")).strip().lower() or "brief"
+        # ``args.get("detail")`` may return None (caller passed
+        # ``{"detail": null}``); treat that as "not provided" and fall
+        # back to the default rather than coercing to the string
+        # ``'none'`` — which would produce a confusing "detail must be
+        # one of …" error for what's effectively a missing arg.
+        raw_detail = args.get("detail")
+        if raw_detail is None:
+            detail = "brief"
+        else:
+            detail = str(raw_detail).strip().lower() or "brief"
         if detail not in {"compact", "brief", "full"}:
             return {"error": f"detail must be one of compact|brief|full (got {detail!r})"}
 

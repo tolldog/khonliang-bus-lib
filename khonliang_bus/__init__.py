@@ -32,7 +32,7 @@ For testing::
     result = await harness.call("do_thing", {"x": "hello"})
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 from khonliang_bus.agent import (
     BaseAgent,
@@ -97,6 +97,8 @@ __all__ = [
     "SkillAuthority",
     "SkillDescriptor",
     "SkillStatus",
+    "Welcome",
+    "WelcomeEntryPoint",
     "add_version_flag",
     "handler",
     "resolve_version",

@@ -488,7 +488,7 @@ class BaseAgent:
         return subclass_skills + extras
 
     @handler("welcome")
-    async def handle_welcome(self, args: Any) -> dict:
+    async def handle_welcome(self, args: dict) -> dict:
         """Return cold-start orientation: identity + role + skill catalog.
 
         Auto-derived fields always present: agent_id, agent_type,
@@ -520,24 +520,14 @@ class BaseAgent:
         LLM can see what's there, what's missing, and ask for the
         agent / skills to be documented.
         """
-        # Normalize ``args``: a transport-level glitch could deliver
-        # ``args=None`` or a non-dict (e.g. a JSON ``null`` or list).
-        # Returning a clean validation error is friendlier than letting
-        # ``AttributeError: 'NoneType' object has no attribute 'get'``
-        # bubble up through the bus as a transport failure.
-        if args is None:
-            args = {}
-        elif not isinstance(args, dict):
-            return {
-                "error": (
-                    f"args must be an object (got {type(args).__name__})"
-                )
-            }
         # ``args.get("detail")`` may return None (caller passed
         # ``{"detail": null}``); treat that as "not provided" and fall
         # back to the default rather than coercing to the string
         # ``'none'`` — which would produce a confusing "detail must be
-        # one of …" error for what's effectively a missing arg.
+        # one of …" error for what's effectively a missing arg. Per-
+        # call wrapper normalization (None / non-dict args) lives in
+        # ``_dispatch_request`` (fr_khonliang-bus-lib_d900f0b5); this
+        # handler is guaranteed to receive a dict.
         raw_detail = args.get("detail")
         if raw_detail is None:
             detail = "brief"
@@ -828,9 +818,28 @@ class BaseAgent:
         handler crashes). The connector catches these and sends an error
         message to the bus. Handler return values — even dicts with an
         "error" key — are treated as legitimate payloads.
+
+        Wrapper-shape normalization (fr_khonliang-bus-lib_d900f0b5): the
+        bus may legitimately deliver ``args=null`` (JSON null) or, in a
+        malformed-input case, a non-dict shape (list, scalar). Handlers
+        should never have to defend against either — the dispatcher
+        normalizes once so every @handler method receives a dict. Per-
+        skill schema validation (typed contracts beyond "is it a dict")
+        lives in fr_khonliang-bus-lib_6e42567d, not here.
         """
         operation = msg.get("operation", "")
-        args = msg.get("args", {})
+        raw_args = msg.get("args", {})
+
+        if raw_args is None:
+            args: dict = {}
+        elif isinstance(raw_args, dict):
+            args = raw_args
+        else:
+            return {
+                "error": (
+                    f"args must be an object (got {type(raw_args).__name__})"
+                )
+            }
 
         handler_fn = self._handlers.get(operation)
         if not handler_fn:

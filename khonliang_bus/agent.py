@@ -472,7 +472,6 @@ class BaseAgent:
             return {"error": f"detail must be one of compact|brief|full (got {detail!r})"}
 
         skills = self._all_skills()
-        categories = self._categorize_skills(skills)
 
         out: dict[str, Any] = {
             "agent_id": self.agent_id,
@@ -481,12 +480,28 @@ class BaseAgent:
             "skill_count": len(skills),
         }
 
-        editorial = self.WELCOME.to_dict() if isinstance(self.WELCOME, Welcome) else {}
+        # Refuse silently-dropped editorial: a subclass that sets
+        # WELCOME to anything other than a Welcome instance is a
+        # programmer error and should fail loudly, not produce a
+        # response missing role / mission / entry_points without
+        # explanation.
+        if not isinstance(self.WELCOME, Welcome):
+            raise TypeError(
+                f"{type(self).__name__}.WELCOME must be a Welcome instance "
+                f"(got {type(self.WELCOME).__name__}). Replace the class "
+                f"attribute with WELCOME = Welcome(...)."
+            )
+        editorial = self.WELCOME.to_dict()
         if "role" in editorial:
             out["role"] = editorial["role"]
 
         if detail == "compact":
             return out
+
+        # Categorize only when the response will actually use it
+        # (brief / full); compact returns above without paying the
+        # sort + group cost.
+        categories = self._categorize_skills(skills)
 
         # brief + full: add editorial mission + boundaries + entry_points
         for key in ("mission", "boundaries", "entry_points", "guide_skill"):
@@ -505,18 +520,25 @@ class BaseAgent:
             }
         return out
 
-    @staticmethod
-    def _categorize_skills(skills: list[Skill]) -> dict[str, list[Skill]]:
+    @classmethod
+    def _categorize_skills(cls, skills: list[Skill]) -> dict[str, list[Skill]]:
         """Group skills by name prefix.
 
         Heuristic: split on first underscore; the prefix is the
         category. Skills with no underscore land in ``misc``. Built-in
-        skills (health_check, welcome) get their own category for
-        visibility — they're always present and shouldn't dilute a
-        domain category's count.
+        skills (derived from ``BUILT_IN_SKILLS``) get their own
+        ``builtin`` bucket for visibility — they're always present and
+        shouldn't dilute a domain category's count. Sourcing the names
+        from the tuple keeps this in lock-step with whatever the agent
+        actually treats as a built-in.
+
+        ``classmethod`` (not ``staticmethod``) so the lookup of
+        ``cls.BUILT_IN_SKILLS`` honors any subclass override of the
+        tuple — a subclass that adds a built-in via tuple extension
+        gets it bucketed correctly without overriding this method.
         """
         groups: dict[str, list[Skill]] = {}
-        builtin_names = {"health_check", "welcome"}
+        builtin_names = {s.name for s in cls.BUILT_IN_SKILLS}
         for s in sorted(skills, key=lambda x: x.name):
             if s.name in builtin_names:
                 groups.setdefault("builtin", []).append(s)

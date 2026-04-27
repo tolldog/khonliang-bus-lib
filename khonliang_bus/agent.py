@@ -121,8 +121,16 @@ class Skill:
     default_timeout_s: float | None = None
 
     def __post_init__(self) -> None:
-        self.parameters = dict(self.parameters)
-        self.input_schema = dict(self.input_schema or self.parameters)
+        # Deep-copy so per-parameter nested dicts (type/default/description
+        # objects, JSON-schema sub-trees) don't alias across Skill clones.
+        # ``_all_skills`` rebuilds built-ins via ``Skill(**s.to_dict())``;
+        # without deepcopy, a caller mutating ``params['detail']['default']``
+        # on one clone would silently corrupt ``BUILT_IN_SKILLS`` for every
+        # subsequent call (and every other agent in the process).
+        from copy import deepcopy
+
+        self.parameters = deepcopy(dict(self.parameters))
+        self.input_schema = deepcopy(dict(self.input_schema or self.parameters))
         if self.output_contract is not None:
             self.output_contract = (
                 self.output_contract

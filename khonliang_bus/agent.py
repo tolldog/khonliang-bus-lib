@@ -159,8 +159,21 @@ class Skill:
         # list. ``None`` is coerced to an empty list / string so a
         # caller passing JSON ``null`` for an unset aspect doesn't
         # raise ``TypeError`` at construction.
+        #
+        # Reject ``str`` explicitly: ``list("foo")`` silently splits
+        # into ``['f','o','o']`` (Python's iteration semantics for
+        # strings), which would corrupt a list-aspect with single-
+        # character entries instead of failing fast. Caller mistake
+        # we want surfaced loudly.
         if self.prompt is None:
             self.prompt = ""
+        for aspect_name in ("examples", "pairs_with", "not_appropriate_for"):
+            value = getattr(self, aspect_name)
+            if isinstance(value, str):
+                raise TypeError(
+                    f"Skill {aspect_name!r} must be a list (got str). "
+                    f"Wrap a single entry in a list: {aspect_name}=[{value!r}]."
+                )
         self.examples = deepcopy(list(self.examples)) if self.examples else []
         self.pairs_with = list(self.pairs_with) if self.pairs_with else []
         self.not_appropriate_for = (

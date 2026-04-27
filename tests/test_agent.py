@@ -1176,6 +1176,22 @@ async def test_help_rejects_non_list_skill_names(aspect_agent):
     assert "list" in result["error"]
 
 
+def test_skill_rejects_str_for_list_aspects_with_helpful_message():
+    """A caller passing a string by mistake (common JSON/CLI shape)
+    must fail loudly instead of getting silent character-splitting via
+    ``list('foo')`` → ``['f', 'o', 'o']``. The error message points at
+    the offending aspect and shows how to fix it."""
+    for aspect in ("examples", "pairs_with", "not_appropriate_for"):
+        with pytest.raises(TypeError) as exc_info:
+            Skill(name="x", **{aspect: "single-string-by-mistake"})
+        msg = str(exc_info.value)
+        assert aspect in msg
+        assert "list" in msg
+        # Surfaces the offending value so the caller sees what they
+        # passed without re-reading their own code.
+        assert "single-string-by-mistake" in msg
+
+
 def test_skill_examples_are_deep_copied_to_sever_caller_aliasing():
     """``examples`` entries are dicts with nested args/output shapes —
     a shallow ``list(...)`` would still alias the inner dicts to the

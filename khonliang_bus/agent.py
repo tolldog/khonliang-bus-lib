@@ -37,6 +37,7 @@ import os
 import signal
 import sys
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
@@ -138,8 +139,6 @@ class Skill:
         # without deepcopy, a caller mutating ``params['detail']['default']``
         # on one clone would silently corrupt ``BUILT_IN_SKILLS`` for every
         # subsequent call (and every other agent in the process).
-        from copy import deepcopy
-
         self.parameters = deepcopy(dict(self.parameters))
         self.input_schema = deepcopy(dict(self.input_schema or self.parameters))
         if self.output_contract is not None:
@@ -160,8 +159,6 @@ class Skill:
         # list. ``None`` is coerced to an empty list / string so a
         # caller passing JSON ``null`` for an unset aspect doesn't
         # raise ``TypeError`` at construction.
-        from copy import deepcopy
-
         if self.prompt is None:
             self.prompt = ""
         self.examples = deepcopy(list(self.examples)) if self.examples else []
@@ -517,8 +514,10 @@ class BaseAgent:
                     "default": "brief",
                     "description": (
                         "compact (name + description) | brief (+ "
-                        "parameters + input_schema) | full (+ all "
-                        "aspect fields when populated)"
+                        "parameters + input_schema + capability when "
+                        "set) | full (+ aliases + since + populated "
+                        "aspect fields: prompt / examples / "
+                        "pairs_with / not_appropriate_for)"
                     ),
                 },
                 "aspect": {

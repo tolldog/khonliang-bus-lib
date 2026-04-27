@@ -106,6 +106,57 @@ async def test_dispatch_unknown_operation_raises(agent):
         await agent._dispatch_request({"operation": "nope", "args": {}})
 
 
+# -- dispatcher args-shape normalization (fr_khonliang-bus-lib_d900f0b5) --
+
+
+@pytest.mark.asyncio
+async def test_dispatch_normalizes_null_args_to_empty_dict(agent):
+    """``args=null`` is a legitimate transport shape — the dispatcher
+    normalizes to an empty dict so handlers never see None."""
+    result = await agent._dispatch_request({"operation": "echo", "args": None})
+    # echo's handler reads args.get("text", "") — None would have raised
+    # AttributeError; with normalization it returns the empty default.
+    assert result == {"echoed": ""}
+
+
+@pytest.mark.asyncio
+async def test_dispatch_normalizes_missing_args_to_empty_dict(agent):
+    """A request envelope without an ``args`` key at all behaves like
+    ``args={}`` — the dispatcher's ``msg.get('args', {})`` already
+    handles this; pinning it so the contract is explicit."""
+    result = await agent._dispatch_request({"operation": "echo"})
+    assert result == {"echoed": ""}
+
+
+@pytest.mark.asyncio
+async def test_dispatch_rejects_non_dict_args_with_validation_envelope(agent):
+    """Non-dict / non-None args (list, scalar, string) produce a clean
+    validation envelope. The handler is never invoked — the dispatcher
+    short-circuits with an ``error`` field naming the bad type."""
+    for bad in (["not", "a", "dict"], "string", 42, True):
+        result = await agent._dispatch_request(
+            {"operation": "echo", "args": bad}
+        )
+        assert "error" in result
+        assert "object" in result["error"]
+        # The bad-type name must surface so the caller can see what
+        # they sent without re-reading their own code.
+        assert type(bad).__name__ in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_validates_before_unknown_op_check(agent):
+    """Dispatcher rejects bad-shape args even when the operation
+    itself is unknown — the validation envelope wins over the unknown-
+    operation ValueError. Either ordering is defensible; pin the
+    chosen one so future refactors don't accidentally invert it."""
+    result = await agent._dispatch_request(
+        {"operation": "nope", "args": ["bad"]}
+    )
+    assert "error" in result
+    assert "object" in result["error"]
+
+
 # -- CLI --
 
 def test_from_cli():

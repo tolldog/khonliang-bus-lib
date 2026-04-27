@@ -297,17 +297,22 @@ class Welcome:
         # Coerce to immutable shapes regardless of what the caller
         # passed. ``object.__setattr__`` is the standard frozen-dataclass
         # idiom — direct ``self.x = ...`` would raise FrozenInstanceError.
+        #
+        # Always re-wrap ``delegates_to``: even when the caller passes an
+        # existing ``MappingProxyType``, that proxy may wrap a mutable
+        # dict the caller still holds — mutating that backing dict would
+        # leak into the frozen Welcome. Copying via ``dict(...)`` then
+        # rewrapping severs the reference.
         object.__setattr__(
             self,
             "not_responsible_for",
             tuple(self.not_responsible_for),
         )
-        if not isinstance(self.delegates_to, MappingProxyType):
-            object.__setattr__(
-                self,
-                "delegates_to",
-                MappingProxyType(dict(self.delegates_to)),
-            )
+        object.__setattr__(
+            self,
+            "delegates_to",
+            MappingProxyType(dict(self.delegates_to)),
+        )
         object.__setattr__(
             self,
             "entry_points",
@@ -439,7 +444,17 @@ class BaseAgent:
                 "detail": {
                     "type": "string",
                     "default": "brief",
-                    "description": "compact (identity + role) | brief (+ entry points + skill counts) | full (+ all skill names by category)",
+                    "description": (
+                        "compact (identity + version + skill_count + "
+                        "role) | brief (+ mission + boundaries + "
+                        "entry_points + skill_categories — when the "
+                        "agent populates WELCOME; otherwise the "
+                        "fallback emits documentation_gaps and a "
+                        "synthesized missing-doc role/mission) | full "
+                        "(+ skills_by_category, plus "
+                        "skill_documentation_gaps for undocumented "
+                        "agents)"
+                    ),
                 },
             },
         ),
@@ -505,6 +520,19 @@ class BaseAgent:
         LLM can see what's there, what's missing, and ask for the
         agent / skills to be documented.
         """
+        # Normalize ``args``: a transport-level glitch could deliver
+        # ``args=None`` or a non-dict (e.g. a JSON ``null`` or list).
+        # Returning a clean validation error is friendlier than letting
+        # ``AttributeError: 'NoneType' object has no attribute 'get'``
+        # bubble up through the bus as a transport failure.
+        if args is None:
+            args = {}
+        elif not isinstance(args, dict):
+            return {
+                "error": (
+                    f"args must be an object (got {type(args).__name__})"
+                )
+            }
         # ``args.get("detail")`` may return None (caller passed
         # ``{"detail": null}``); treat that as "not provided" and fall
         # back to the default rather than coercing to the string

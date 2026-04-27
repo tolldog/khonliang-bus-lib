@@ -837,6 +837,45 @@ def test_welcome_collections_are_immutable_after_construction():
         )
 
 
+def test_welcome_rewraps_existing_mappingproxy_to_sever_caller_alias():
+    """If the caller passes a ``MappingProxyType`` that wraps a dict
+    they still hold, ``__post_init__`` must copy + re-wrap so later
+    mutation of the caller's backing dict doesn't bleed into the
+    frozen Welcome."""
+    from types import MappingProxyType
+
+    backing = {"researcher": "evidence/context only"}
+    caller_proxy = MappingProxyType(backing)
+    w = Welcome(delegates_to=caller_proxy)
+
+    backing["leaked"] = "should not appear"
+    assert "leaked" not in w.delegates_to
+    assert dict(w.delegates_to) == {"researcher": "evidence/context only"}
+
+
+@pytest.mark.asyncio
+async def test_welcome_handles_null_args_cleanly(agent):
+    """``args=None`` (transport-level glitch / JSON null) must not
+    raise — returns the same shape as an empty args dict."""
+    result = await agent._dispatch_request(
+        {"operation": "welcome", "args": None}
+    )
+    assert "error" not in result
+    assert result["agent_id"] == "echo-test"
+    assert result["skill_count"] == 5
+
+
+@pytest.mark.asyncio
+async def test_welcome_rejects_non_dict_args(agent):
+    """A non-dict / non-None args produces a clean validation error
+    instead of an AttributeError leaking as a transport failure."""
+    result = await agent._dispatch_request(
+        {"operation": "welcome", "args": ["unexpected", "list"]}
+    )
+    assert "error" in result
+    assert "object" in result["error"]
+
+
 def test_skill_doc_gaps_flags_missing_fields():
     """The per-skill gap helper reports description / parameters /
     capability gaps independently."""

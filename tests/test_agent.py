@@ -641,7 +641,7 @@ async def test_welcome_default_brief_announces_undocumented(agent):
     assert result["agent_id"] == "echo-test"
     assert result["agent_type"] == "echo"
     assert result["version"] == "0.2.0"
-    assert result["skill_count"] == 6  # echo, upper, fail, health_check, welcome
+    assert result["skill_count"] == 6  # echo, upper, fail, health_check, welcome, help
     # Synthesized fallback editorial — the lib announces the undocumented
     # state instead of returning a sparse silent response.
     assert result["role"].startswith("(undocumented agent")
@@ -660,7 +660,7 @@ async def test_welcome_default_brief_announces_undocumented(agent):
     assert "entry_points" not in result
     # Categories still present at brief detail.
     assert "skill_categories" in result
-    # health_check + welcome are the builtin category.
+    # health_check + welcome + help are the builtin category.
     assert result["skill_categories"]["builtin"] == 3
 
 
@@ -1174,6 +1174,36 @@ async def test_help_rejects_non_list_skill_names(aspect_agent):
     )
     assert "error" in result
     assert "list" in result["error"]
+
+
+def test_skill_examples_are_deep_copied_to_sever_caller_aliasing():
+    """``examples`` entries are dicts with nested args/output shapes —
+    a shallow ``list(...)`` would still alias the inner dicts to the
+    caller's literals. Mutation of a caller-held example dict after
+    construction must not bleed into the registered Skill."""
+    backing = {"input_args": {"q": "x"}, "expected_output_shape": "ok"}
+    s = Skill(name="x", examples=[backing])
+    backing["input_args"]["q"] = "leaked"
+    backing["expected_output_shape"] = "leaked"
+    assert s.examples[0]["input_args"]["q"] == "x"
+    assert s.examples[0]["expected_output_shape"] == "ok"
+
+
+def test_skill_aspect_none_inputs_are_coerced_to_empty():
+    """A caller passing ``None`` for an aspect (JSON null in the
+    registration payload) must not raise — None coerces to the empty
+    default rather than ``TypeError`` in __post_init__."""
+    s = Skill(
+        name="x",
+        prompt=None,  # type: ignore[arg-type]
+        examples=None,  # type: ignore[arg-type]
+        pairs_with=None,  # type: ignore[arg-type]
+        not_appropriate_for=None,  # type: ignore[arg-type]
+    )
+    assert s.prompt == ""
+    assert s.examples == []
+    assert s.pairs_with == []
+    assert s.not_appropriate_for == []
 
 
 def test_skill_aspect_fields_round_trip_through_to_dict():

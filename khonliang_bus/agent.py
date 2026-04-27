@@ -151,13 +151,24 @@ class Skill:
         self.authority = SkillAuthority.coerce(self.authority)
         self.status = SkillStatus.coerce(self.status)
         self.aliases = list(self.aliases)
-        # Aspect-field coercion: shallow copies so mutations on the
-        # caller's literals don't leak. Type checks are lenient — these
-        # are advisory editorial fields and a misuse-case isn't worth
-        # a hard fail at construction.
-        self.examples = list(self.examples)
-        self.pairs_with = list(self.pairs_with)
-        self.not_appropriate_for = list(self.not_appropriate_for)
+        # Aspect-field coercion: ``examples`` is deep-copied because
+        # each entry is a dict with nested ``input_args`` /
+        # ``expected_output_shape`` shapes — a shallow ``list(...)``
+        # would still alias the inner dicts to the caller's literals.
+        # The simpler list-of-strings aspects (``pairs_with``,
+        # ``not_appropriate_for``) only need a shallow copy of the outer
+        # list. ``None`` is coerced to an empty list / string so a
+        # caller passing JSON ``null`` for an unset aspect doesn't
+        # raise ``TypeError`` at construction.
+        from copy import deepcopy
+
+        if self.prompt is None:
+            self.prompt = ""
+        self.examples = deepcopy(list(self.examples)) if self.examples else []
+        self.pairs_with = list(self.pairs_with) if self.pairs_with else []
+        self.not_appropriate_for = (
+            list(self.not_appropriate_for) if self.not_appropriate_for else []
+        )
         self.execution_profiles = [
             profile
             if isinstance(profile, ExecutionProfile)
@@ -818,8 +829,14 @@ class BaseAgent:
         skills = self._all_skills()
         by_name = {s.name: s for s in skills}
 
-        # Empty list = full catalog. Preserves the deterministic
-        # alphabetical order ``_all_skills`` already returns from.
+        # Empty list = full catalog. Sort alphabetically here for
+        # determinism — ``_all_skills`` itself preserves subclass
+        # registration order followed by ``BUILT_IN_SKILLS`` tuple
+        # order, which would surface different orderings to different
+        # agents. Sorting once at the response-shaping step gives a
+        # stable, comparable catalog across the fleet without forcing
+        # ``_all_skills`` callers (e.g. categorization, welcome) to pay
+        # for ordering they don't need.
         if not skill_names:
             target_names = sorted(by_name)
         else:

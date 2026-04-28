@@ -1272,25 +1272,25 @@ class BaseAgent:
         Schema lookup falls back to ``parameters`` when
         ``input_schema`` is empty — legacy registrations that only
         set ``parameters`` still validate correctly.
+
+        An explicitly-empty schema (``{}``) is treated as a valid
+        zero-args contract under ``strict_args=True``: the skill
+        author has declared "this takes nothing", so any kwarg the
+        caller supplies is rejected as unknown. Health-check-shape
+        skills that take no arguments use this path. (We can't tell
+        ``Skill(parameters={})`` from the dataclass default-empty at
+        runtime, but the strict_args opt-in makes the author's
+        intent explicit either way.)
         """
         schema = skill.input_schema or skill.parameters
-        if not schema:
-            # No declared schema → nothing to validate. Strict-args
-            # without a schema is a meaningless registration; surface
-            # this so the agent author notices, but don't reject the
-            # call (would block every consumer for a registration bug).
-            logger.warning(
-                "Skill %r has strict_args=True but no input_schema / "
-                "parameters declared — validation skipped.",
-                skill.name,
-            )
-            return None
-
         accepted = set(schema)
         unknown = set(args) - accepted
         if unknown:
             unknown_list = ", ".join(sorted(unknown))
-            accepted_list = ", ".join(sorted(accepted)) or "(none)"
+            accepted_list = (
+                ", ".join(sorted(accepted))
+                or "(none — skill declared empty schema)"
+            )
             return (
                 f"unknown args for {skill.name!r}: {unknown_list}. "
                 f"Accepted: {accepted_list}."

@@ -1677,6 +1677,47 @@ def test_strict_args_serializes_only_when_true():
     assert "strict_args" not in off.to_dict()
 
 
+@pytest.mark.asyncio
+async def test_strict_args_empty_schema_rejects_any_kwargs():
+    """An explicitly-empty schema with strict_args=True is a valid
+    zero-args contract — any kwarg the caller supplies is rejected
+    as unknown. Health-check-shape skills that legitimately take no
+    arguments use this path. The accepted-set message names the
+    empty-schema case explicitly so the caller doesn't think the
+    error message is broken."""
+
+    class ZeroArgs(BaseAgent):
+        agent_type = "zeroargs"
+        module_name = "tests.test_agent"
+
+        def register_skills(self):
+            return [
+                Skill(
+                    name="ping",
+                    description="Takes nothing.",
+                    parameters={},
+                    strict_args=True,
+                ),
+            ]
+
+        @handler("ping")
+        async def ping(self, args):
+            return {"pong": True}
+
+    a = ZeroArgs(agent_id="zero-test", bus_url="http://localhost:9999")
+    # Empty args → handler runs.
+    ok = await a._dispatch_request({"operation": "ping", "args": {}})
+    assert ok == {"pong": True}
+    # Any kwarg → rejected with the empty-schema marker.
+    bad = await a._dispatch_request({
+        "operation": "ping",
+        "args": {"unexpected": "value"},
+    })
+    assert "error" in bad
+    assert "unexpected" in bad["error"]
+    assert "empty schema" in bad["error"]
+
+
 def test_skill_rejects_non_bool_strict_args():
     """``strict_args`` must be a real ``bool``. Truthy non-bool values
     ('true', 1, [1]) silently enabling validation while ``to_dict()``

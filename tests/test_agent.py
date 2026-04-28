@@ -1394,3 +1394,485 @@ def test_skill_aspect_fields_round_trip_through_to_dict():
     assert "pairs_with" not in bare_payload
     assert "not_appropriate_for" not in bare_payload
     assert "examples" not in bare_payload
+
+
+# ---------------------------------------------------------------------------
+# Mode B — bus-side schema validation (fr_khonliang-bus-lib_6e42567d)
+# ---------------------------------------------------------------------------
+
+
+class StrictAgent(BaseAgent):
+    """Agent with skills that opt into strict-args validation, exercising
+    every failure class the dispatcher checks: unknown kwargs, missing
+    required, wrong type."""
+
+    agent_type = "strict"
+    module_name = "tests.test_agent"
+    version = "0.4.0"
+
+    def register_skills(self):
+        return [
+            Skill(
+                name="strict_echo",
+                description="Echo with declared schema and strict_args.",
+                parameters={
+                    "text": {"type": "string", "required": True},
+                    "loud": {"type": "boolean"},
+                },
+                strict_args=True,
+            ),
+            Skill(
+                name="strict_count",
+                description="Counts and casts to declared types.",
+                parameters={
+                    "n": {"type": "integer", "required": True},
+                    "tags": {"type": "array"},
+                    "extra": {"type": "object"},
+                },
+                strict_args=True,
+            ),
+            Skill(
+                name="lenient_echo",
+                description="Same shape, no strict_args (legacy default).",
+                parameters={"text": {"type": "string", "required": True}},
+            ),
+        ]
+
+    @handler("strict_echo")
+    async def strict_echo(self, args):
+        return {"echoed": args.get("text", ""), "loud": args.get("loud", False)}
+
+    @handler("strict_count")
+    async def strict_count(self, args):
+        return {"n": args["n"], "tags": args.get("tags", [])}
+
+    @handler("lenient_echo")
+    async def lenient_echo(self, args):
+        return {"echoed": args.get("text", "")}
+
+
+@pytest.fixture
+def strict_agent():
+    return StrictAgent(agent_id="strict-test", bus_url="http://localhost:9999")
+
+
+@pytest.mark.asyncio
+async def test_strict_args_rejects_unknown_kwargs_with_accepted_set(strict_agent):
+    """The silent-arg-drop class (bug_developer_ad60dca4 / b5fd44ce /
+    a349c77b): caller passes ``txt`` instead of ``text``; today that's
+    silently ignored and the handler runs with the wrong args. Strict
+    validation rejects with a message naming the bad key + the
+    accepted-set so the caller learns what they should have used."""
+    result = await strict_agent._dispatch_request({
+        "operation": "strict_echo",
+        "args": {"txt": "hello"},
+    })
+    assert "error" in result
+    assert "txt" in result["error"]
+    # accepted set surfaces both declared keys, alphabetically sorted
+    assert "loud, text" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_strict_args_rejects_missing_required_arg(strict_agent):
+    """Required-but-missing fails fast with a clear message — no silent
+    handler call against an empty dict."""
+    result = await strict_agent._dispatch_request({
+        "operation": "strict_echo",
+        "args": {"loud": True},
+    })
+    assert "error" in result
+    assert "missing required" in result["error"]
+    assert "text" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_strict_args_rejects_wrong_type(strict_agent):
+    """Type mismatch surfaces declared and actual types so the caller
+    can correct without re-reading the schema. The OFFENDING VALUE is
+    deliberately NOT in the error envelope — it could be a 50KB blob
+    or sensitive content (API keys, paper text, user PII) and would
+    otherwise leak into bus responses + downstream logs."""
+    result = await strict_agent._dispatch_request({
+        "operation": "strict_echo",
+        "args": {"text": 42},
+    })
+    assert "error" in result
+    assert "string" in result["error"]
+    assert "int" in result["error"]
+    # The bad value (42) must NOT appear in the error — leakage guard.
+    assert "42" not in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_strict_args_does_not_leak_large_payload_in_error(strict_agent):
+    """Real-world version of the leakage guard: caller passes a large
+    string where a non-string type is expected. The error message stays
+    bounded — only declared / actual type names — so a multi-KB
+    payload never lands in the bus response or downstream logs."""
+    big_value = "X" * 5000  # 5KB; could just as easily be 50KB
+    result = await strict_agent._dispatch_request({
+        "operation": "strict_count",
+        "args": {"n": big_value},
+    })
+    assert "error" in result
+    # Error length is bounded regardless of input value size.
+    assert len(result["error"]) < 200, (
+        f"error grew with value size — likely leaking value: "
+        f"{result['error'][:200]}..."
+    )
+    assert "integer" in result["error"]
+    assert big_value not in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_strict_args_rejects_bool_for_integer(strict_agent):
+    """``bool`` is a subclass of ``int`` in Python — accepting True/
+    False where an integer is declared is almost always a caller bug.
+    Validation rejects it explicitly."""
+    result = await strict_agent._dispatch_request({
+        "operation": "strict_count",
+        "args": {"n": True},
+    })
+    assert "error" in result
+    assert "integer" in result["error"]
+    assert "bool" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_strict_args_validates_array_and_object_types(strict_agent):
+    """JSON-schema ``array`` requires list, ``object`` requires dict."""
+    bad_array = await strict_agent._dispatch_request({
+        "operation": "strict_count",
+        "args": {"n": 3, "tags": "not-a-list"},
+    })
+    assert "error" in bad_array
+    assert "array" in bad_array["error"]
+
+    bad_object = await strict_agent._dispatch_request({
+        "operation": "strict_count",
+        "args": {"n": 3, "extra": ["not", "a", "dict"]},
+    })
+    assert "error" in bad_object
+    assert "object" in bad_object["error"]
+
+
+@pytest.mark.asyncio
+async def test_strict_args_passes_well_formed_call(strict_agent):
+    """Sanity: a well-formed call hits the handler and returns its
+    result. Validation must not get in the way of correct callers."""
+    result = await strict_agent._dispatch_request({
+        "operation": "strict_echo",
+        "args": {"text": "hi", "loud": True},
+    })
+    assert result == {"echoed": "hi", "loud": True}
+
+
+@pytest.mark.asyncio
+async def test_strict_args_skips_validation_when_flag_false(strict_agent):
+    """``lenient_echo`` shares the same schema shape but omits
+    strict_args — the dispatcher must NOT validate, so the historical
+    silent-pass-through behavior holds. This is the load-bearing
+    backward-compat property: every existing skill in the fleet keeps
+    working unchanged."""
+    # Unknown kwarg silently passes through to the handler; handler
+    # uses ``args.get("text", "")`` so it sees the empty default.
+    result = await strict_agent._dispatch_request({
+        "operation": "lenient_echo",
+        "args": {"txt": "typo"},
+    })
+    assert "error" not in result
+    assert result == {"echoed": ""}
+
+
+@pytest.mark.asyncio
+async def test_strict_args_falls_back_to_parameters_when_input_schema_empty():
+    """Legacy registrations that only set ``parameters`` (without a
+    separate input_schema) still validate — the schema lookup falls
+    back to parameters when input_schema is empty. Most existing
+    Skill(...) call sites in the fleet are this shape."""
+
+    class LegacyShape(BaseAgent):
+        agent_type = "legacy"
+        module_name = "tests.test_agent"
+
+        def register_skills(self):
+            return [
+                Skill(
+                    name="legacy_skill",
+                    description="d",
+                    parameters={"q": {"type": "string", "required": True}},
+                    strict_args=True,
+                ),
+            ]
+
+        @handler("legacy_skill")
+        async def legacy_skill(self, args):
+            return {"q": args.get("q", "")}
+
+    a = LegacyShape(agent_id="legacy-test", bus_url="http://localhost:9999")
+    bad = await a._dispatch_request({
+        "operation": "legacy_skill",
+        "args": {"qq": "wrong-key"},
+    })
+    assert "error" in bad
+    assert "qq" in bad["error"]
+    good = await a._dispatch_request({
+        "operation": "legacy_skill",
+        "args": {"q": "ok"},
+    })
+    assert good == {"q": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_strict_args_unknown_type_in_schema_skips_type_check():
+    """A schema with a non-standard / unknown ``type`` value still
+    validates presence + required, but skips type checking on that
+    field — keeps forward-compat with future JSON-Schema additions
+    (``date-time``, custom types, etc.) without rejecting them."""
+
+    class ForwardCompat(BaseAgent):
+        agent_type = "forward"
+        module_name = "tests.test_agent"
+
+        def register_skills(self):
+            return [
+                Skill(
+                    name="future_skill",
+                    description="d",
+                    parameters={
+                        "id": {"type": "uuid", "required": True},
+                    },
+                    strict_args=True,
+                ),
+            ]
+
+        @handler("future_skill")
+        async def future_skill(self, args):
+            return {"id": args.get("id")}
+
+    a = ForwardCompat(agent_id="forward", bus_url="http://localhost:9999")
+    # Required-presence check still fires.
+    missing = await a._dispatch_request({
+        "operation": "future_skill",
+        "args": {},
+    })
+    assert "error" in missing
+    assert "missing required" in missing["error"]
+    # But any value is accepted on the unrecognized type.
+    ok = await a._dispatch_request({
+        "operation": "future_skill",
+        "args": {"id": "anything-goes"},
+    })
+    assert ok == {"id": "anything-goes"}
+
+
+def test_strict_args_serializes_only_when_true():
+    """strict_args=True surfaces in the registration payload (so the
+    bus / consumers can see the contract); strict_args=False stays
+    omitted to keep the payload signal-dense."""
+    on = Skill(name="x", parameters={"q": {"type": "string"}}, strict_args=True)
+    off = Skill(name="y", parameters={"q": {"type": "string"}})
+    assert on.to_dict()["strict_args"] is True
+    assert "strict_args" not in off.to_dict()
+
+
+@pytest.mark.asyncio
+async def test_strict_args_empty_schema_rejects_any_kwargs():
+    """An explicitly-empty schema with strict_args=True is a valid
+    zero-args contract — any kwarg the caller supplies is rejected
+    as unknown. Health-check-shape skills that legitimately take no
+    arguments use this path. The accepted-set message names the
+    empty-schema case explicitly so the caller doesn't think the
+    error message is broken."""
+
+    class ZeroArgs(BaseAgent):
+        agent_type = "zeroargs"
+        module_name = "tests.test_agent"
+
+        def register_skills(self):
+            return [
+                Skill(
+                    name="ping",
+                    description="Takes nothing.",
+                    parameters={},
+                    strict_args=True,
+                ),
+            ]
+
+        @handler("ping")
+        async def ping(self, args):
+            return {"pong": True}
+
+    a = ZeroArgs(agent_id="zero-test", bus_url="http://localhost:9999")
+    # Empty args → handler runs.
+    ok = await a._dispatch_request({"operation": "ping", "args": {}})
+    assert ok == {"pong": True}
+    # Any kwarg → rejected with the empty-schema marker.
+    bad = await a._dispatch_request({
+        "operation": "ping",
+        "args": {"unexpected": "value"},
+    })
+    assert "error" in bad
+    assert "unexpected" in bad["error"]
+    assert "empty schema" in bad["error"]
+
+
+def test_skill_rejects_non_bool_strict_args():
+    """``strict_args`` must be a real ``bool``. Truthy non-bool values
+    ('true', 1, [1]) silently enabling validation while ``to_dict()``
+    serializes them as ``True`` would mask the misuse from downstream
+    consumers reading the registration payload. Construction must
+    fail loudly for the same reason str-rejection covers the list-
+    aspects: a public flag deserves type-locked semantics."""
+    for bad in ("true", "false", 1, 0, [True], {"strict": True}):
+        with pytest.raises(TypeError) as exc_info:
+            Skill(name="x", strict_args=bad)  # type: ignore[arg-type]
+        msg = str(exc_info.value)
+        assert "strict_args" in msg
+        assert "bool" in msg
+        assert type(bad).__name__ in msg
+    # Real bools accepted on either side.
+    Skill(name="ok_true", strict_args=True)
+    Skill(name="ok_false", strict_args=False)
+
+
+@pytest.mark.asyncio
+async def test_strict_args_uses_input_schema_when_diverges_from_parameters():
+    """When ``input_schema`` is non-empty, validation uses it — NOT
+    ``parameters``. Pre-existing skills set parameters only and rely
+    on the input_schema-or-parameters fallback; future skills can
+    declare a richer input_schema (e.g. richer types in input_schema,
+    legacy MCP-shaped params) and the validator must follow the
+    richer one. A regression that swaps precedence to parameters-
+    primary would silently bypass strict checks."""
+
+    class DivergentSchema(BaseAgent):
+        agent_type = "divergent"
+        module_name = "tests.test_agent"
+
+        def register_skills(self):
+            return [
+                Skill(
+                    name="diverge_skill",
+                    description="d",
+                    # Legacy MCP-shaped parameters (lenient).
+                    parameters={"loose_field": {"type": "string"}},
+                    # Strict richer schema; validation must use this one.
+                    input_schema={
+                        "strict_field": {"type": "string", "required": True},
+                    },
+                    strict_args=True,
+                ),
+            ]
+
+        @handler("diverge_skill")
+        async def diverge_skill(self, args):
+            return {"got": list(args.keys())}
+
+    a = DivergentSchema(agent_id="div", bus_url="http://localhost:9999")
+    # Passing the parameters-only key fails — input_schema doesn't
+    # accept it.
+    bad = await a._dispatch_request({
+        "operation": "diverge_skill",
+        "args": {"loose_field": "x"},
+    })
+    assert "error" in bad
+    assert "loose_field" in bad["error"]
+    assert "strict_field" in bad["error"]  # accepted-set names input_schema's key
+    # Passing input_schema's key works.
+    good = await a._dispatch_request({
+        "operation": "diverge_skill",
+        "args": {"strict_field": "x"},
+    })
+    assert good == {"got": ["strict_field"]}
+
+
+@pytest.mark.asyncio
+async def test_strict_args_required_field_set_to_none_fails_type_check(strict_agent):
+    """``{"text": None}`` — present in args (so required-check passes),
+    but ``isinstance(None, str)`` is False, so the type check rejects
+    it. Pin the behavior so a future change to "treat None as missing"
+    doesn't slip in unnoticed — callers that expect None to mean
+    'pass-through default' need to omit the key, not pass null."""
+    result = await strict_agent._dispatch_request({
+        "operation": "strict_echo",
+        "args": {"text": None},
+    })
+    assert "error" in result
+    assert "string" in result["error"]
+    assert "NoneType" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_strict_args_all_optional_empty_args_passes():
+    """A skill with no required fields accepts ``args={}`` — the
+    type checks only run for fields that are present, so an empty
+    args is the all-defaults call and must not be rejected."""
+
+    class AllOptional(BaseAgent):
+        agent_type = "alloptional"
+        module_name = "tests.test_agent"
+
+        def register_skills(self):
+            return [
+                Skill(
+                    name="opt_skill",
+                    description="d",
+                    parameters={
+                        "a": {"type": "string"},  # no required flag
+                        "b": {"type": "integer"},
+                    },
+                    strict_args=True,
+                ),
+            ]
+
+        @handler("opt_skill")
+        async def opt_skill(self, args):
+            return {"a": args.get("a"), "b": args.get("b")}
+
+    a = AllOptional(agent_id="opt", bus_url="http://localhost:9999")
+    result = await a._dispatch_request({
+        "operation": "opt_skill",
+        "args": {},
+    })
+    assert "error" not in result
+    assert result == {"a": None, "b": None}
+
+
+@pytest.mark.asyncio
+async def test_strict_args_warns_when_skill_name_doesnt_match_handler(caplog):
+    """Silent-bypass guard: if a Skill declares ``strict_args=True``
+    but its ``name`` doesn't match any registered handler operation,
+    the dispatcher's lookup would miss and validation would silently
+    skip. Loud-warn at first cache build so the agent author notices
+    the misregistration instead of shipping a falsely-strict skill."""
+    import logging
+
+    class Misregistered(BaseAgent):
+        agent_type = "misreg"
+        module_name = "tests.test_agent"
+
+        def register_skills(self):
+            return [
+                Skill(
+                    name="declared_name",  # mismatch — handler is "actual_op"
+                    description="d",
+                    parameters={"q": {"type": "string"}},
+                    strict_args=True,
+                ),
+            ]
+
+        @handler("actual_op")
+        async def actual_op(self, args):
+            return {}
+
+    a = Misregistered(agent_id="misreg-test", bus_url="http://localhost:9999")
+    with caplog.at_level(logging.WARNING):
+        # Trigger cache build via any dispatch.
+        await a._dispatch_request({"operation": "actual_op", "args": {}})
+
+    assert any(
+        "strict_args=True" in rec.message and "declared_name" in rec.message
+        for rec in caplog.records
+    ), "expected warning naming the misregistered skill"

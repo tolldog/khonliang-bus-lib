@@ -138,6 +138,14 @@ class Skill:
     examples: list[dict[str, Any]] = field(default_factory=list, kw_only=True)
     pairs_with: list[str] = field(default_factory=list, kw_only=True)
     not_appropriate_for: list[str] = field(default_factory=list, kw_only=True)
+    # Mode B opt-in (fr_khonliang-bus-lib_6e42567d): when True, the bus
+    # dispatcher validates incoming ``args`` against ``input_schema``
+    # before invoking the handler — required-but-missing args fail
+    # fast, unknown kwargs surface as errors with the accepted set
+    # (closing the silent-arg-drop class structurally). Default False
+    # to keep existing under-declared skill schemas working unchanged;
+    # a follow-up FR audits the fleet and flips the default.
+    strict_args: bool = field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
         # Deep-copy so per-parameter nested dicts (type/default/description
@@ -298,6 +306,12 @@ class Skill:
             for key, value in optional.items()
             if value not in (None, "", [], {})
         })
+        # ``strict_args`` is included only when True so it stays
+        # signal-dense (matches the existing optional-field convention)
+        # but a lurking bool=False false-default in the dict-comprehension
+        # filter above would have dropped True alongside False.
+        if self.strict_args:
+            payload["strict_args"] = True
         return payload
 
     def descriptor(self, provider_id: str, skill_id: str | None = None) -> SkillDescriptor:
@@ -1130,9 +1144,19 @@ class BaseAgent:
         bus may legitimately deliver ``args=null`` (JSON null) or, in a
         malformed-input case, a non-dict shape (list, scalar). Handlers
         should never have to defend against either — the dispatcher
-        normalizes once so every @handler method receives a dict. Per-
-        skill schema validation (typed contracts beyond "is it a dict")
-        lives in fr_khonliang-bus-lib_6e42567d, not here.
+        normalizes once so every @handler method receives a dict.
+
+        Per-skill schema validation (fr_khonliang-bus-lib_6e42567d Mode
+        B): when the registered Skill declares ``strict_args=True``,
+        the dispatcher validates ``args`` against the skill's
+        ``input_schema`` (or ``parameters`` when input_schema is empty)
+        before invoking the handler. Required-but-missing args fail
+        fast; unknown kwargs surface as errors with the accepted set —
+        closing the silent-arg-drop class structurally
+        (bug_developer_ad60dca4 / b5fd44ce / a349c77b). Skills with
+        ``strict_args=False`` (the default) keep their existing
+        permissive behavior; a follow-up FR audits the fleet and flips
+        the default once schemas are caught up.
         """
         operation = msg.get("operation", "")
         raw_args = msg.get("args", {})
@@ -1152,7 +1176,137 @@ class BaseAgent:
         if not handler_fn:
             raise ValueError(f"unknown operation: {operation}")
 
+        # Strict-args validation runs only for skills that opted in.
+        # Lookup is lazy-cached on first dispatch; fleet skill counts
+        # are small (<100 per agent) so the dict-build cost is one-time.
+        skill = self._skill_for_operation(operation)
+        if skill is not None and skill.strict_args:
+            error = self._validate_args_against_schema(skill, args)
+            if error is not None:
+                return {"error": error}
+
         return await handler_fn(args)
+
+    def _skill_for_operation(self, operation: str) -> "Skill | None":
+        """Lazy-cached skill lookup by operation name.
+
+        Cache invalidation is intentionally absent: ``register_skills``
+        runs once at agent construction and the result is stable for
+        the lifetime of the process. If a future code path mutates
+        the registered skills mid-run, that path is responsible for
+        clearing ``self._skills_by_op_cache``.
+
+        On first build, warn loudly when a skill declares
+        ``strict_args=True`` but its name doesn't match any registered
+        handler operation. Without the warning, the dispatcher would
+        silently look up by operation, miss the skill, and skip the
+        validation the author asked for — exactly the silent-bypass
+        bug the strict_args opt-in is meant to close.
+        """
+        cache = getattr(self, "_skills_by_op_cache", None)
+        if cache is None:
+            cache = {}
+            mismatched: list[str] = []
+            for skill in self._all_skills():
+                cache[skill.name] = skill
+                if skill.strict_args and skill.name not in self._handlers:
+                    mismatched.append(skill.name)
+            if mismatched:
+                logger.warning(
+                    "Agent %s: skills declared strict_args=True but have "
+                    "no matching @handler operation; strict-args "
+                    "validation will not run for them. Skills: %s. "
+                    "Either rename the Skill so its name == the @handler "
+                    "operation, or remove strict_args until the handler "
+                    "is registered.",
+                    self.agent_id,
+                    ", ".join(sorted(mismatched)),
+                )
+            self._skills_by_op_cache = cache
+        return cache.get(operation)
+
+    # JSON-Schema-style type-name → Python isinstance tuple. ``bool`` is
+    # excluded from ``integer`` / ``number`` because it's a subclass of
+    # ``int`` and accepting True/False where an integer is expected is
+    # almost always a caller bug worth surfacing.
+    _SCHEMA_TYPE_CHECKS: dict[str, Callable[[Any], bool]] = {
+        "string": lambda v: isinstance(v, str),
+        "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+        "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+        "boolean": lambda v: isinstance(v, bool),
+        "array": lambda v: isinstance(v, list),
+        "object": lambda v: isinstance(v, dict),
+        "null": lambda v: v is None,
+    }
+
+    @classmethod
+    def _validate_args_against_schema(
+        cls, skill: "Skill", args: dict
+    ) -> str | None:
+        """Validate ``args`` against the skill's declared schema.
+
+        Returns an error string on the first failure (caller wraps in
+        ``{"error": ...}``) or ``None`` when valid. Three failure
+        classes, all of which closed silent-drop bugs in the past:
+
+        - **Unknown kwargs**: ``args`` carries a key the schema
+          doesn't declare. Lists the accepted-set so the caller sees
+          what they should have used.
+        - **Required-but-missing**: schema declares
+          ``required=True`` and the key isn't present.
+        - **Wrong type**: declared ``type`` doesn't match the runtime
+          value's class. Surfaces the declared and actual types.
+
+        Schema lookup falls back to ``parameters`` when
+        ``input_schema`` is empty — legacy registrations that only
+        set ``parameters`` still validate correctly.
+        """
+        schema = skill.input_schema or skill.parameters
+        if not schema:
+            # No declared schema → nothing to validate. Strict-args
+            # without a schema is a meaningless registration; surface
+            # this so the agent author notices, but don't reject the
+            # call (would block every consumer for a registration bug).
+            logger.warning(
+                "Skill %r has strict_args=True but no input_schema / "
+                "parameters declared — validation skipped.",
+                skill.name,
+            )
+            return None
+
+        accepted = set(schema)
+        unknown = set(args) - accepted
+        if unknown:
+            unknown_list = ", ".join(sorted(unknown))
+            accepted_list = ", ".join(sorted(accepted)) or "(none)"
+            return (
+                f"unknown args for {skill.name!r}: {unknown_list}. "
+                f"Accepted: {accepted_list}."
+            )
+
+        for field_name, declared in schema.items():
+            if not isinstance(declared, dict):
+                continue
+            present = field_name in args
+            required = bool(declared.get("required", False))
+            if not present:
+                if required:
+                    return (
+                        f"missing required arg for {skill.name!r}: "
+                        f"{field_name!r}."
+                    )
+                continue
+            declared_type = declared.get("type")
+            if not declared_type or declared_type not in cls._SCHEMA_TYPE_CHECKS:
+                continue
+            value = args[field_name]
+            if not cls._SCHEMA_TYPE_CHECKS[declared_type](value):
+                return (
+                    f"arg {field_name!r} for {skill.name!r} must be "
+                    f"{declared_type} (got "
+                    f"{type(value).__name__}: {value!r})."
+                )
+        return None
 
     # -- install/uninstall (HTTP — these are one-shot, not WebSocket) --
 

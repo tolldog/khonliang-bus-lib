@@ -127,10 +127,17 @@ class Skill:
     # aspect is exposed via the ``help(skills, aspect=…)`` skill
     # (fr_khonliang-bus-lib_42555320) so a consumer can ask for the
     # exact slice they need without paying for the full SkillEntry.
-    prompt: str = ""              # example prompt template the consumer can lightly adapt
-    examples: list[dict[str, Any]] = field(default_factory=list)  # [{input_args, expected_output_shape, narrative}]
-    pairs_with: list[str] = field(default_factory=list)  # skill names commonly chained with this one
-    not_appropriate_for: list[str] = field(default_factory=list)  # cases where this skill is the WRONG call
+    #
+    # ``kw_only=True`` so adding these fields doesn't shift the
+    # positional-arg signature: existing call sites that passed
+    # ``default_timeout_s`` (or any prior optional) positionally
+    # still bind correctly. Any caller that wants the new fields
+    # passes them by keyword, which is the only sensible shape for
+    # editorial metadata anyway.
+    prompt: str = field(default="", kw_only=True)
+    examples: list[dict[str, Any]] = field(default_factory=list, kw_only=True)
+    pairs_with: list[str] = field(default_factory=list, kw_only=True)
+    not_appropriate_for: list[str] = field(default_factory=list, kw_only=True)
 
     def __post_init__(self) -> None:
         # Deep-copy so per-parameter nested dicts (type/default/description
@@ -167,13 +174,24 @@ class Skill:
                 f"{type(self.prompt).__name__}: {self.prompt!r})."
             )
 
-        # List-aspects must be ``list`` (None coerces to []). ``str``
-        # gets a specific hint because ``list('foo')`` silently splits
-        # into ``['f','o','o']`` (the easy JSON / CLI mistake); every
-        # other non-list type is rejected as the generic "expected
-        # list, got X" case so dict / bool / int / etc. can't sneak
-        # through and silently coerce into a corrupt list-aspect.
-        for aspect_name in ("examples", "pairs_with", "not_appropriate_for"):
+        # List-aspects must be ``list`` of the right element type
+        # (None coerces to []). ``str`` gets a specific outer-container
+        # hint because ``list('foo')`` silently splits into
+        # ``['f','o','o']`` (the easy JSON / CLI mistake); every other
+        # non-list type is rejected as the generic "expected list, got
+        # X" case so dict / bool / int / etc. can't sneak through.
+        # Element types are validated too — a stray non-string in
+        # ``pairs_with`` or non-dict in ``examples`` would corrupt the
+        # registration payload that downstream consumers (the ``help``
+        # skill, sibling agents reading aspect=schema, the future
+        # bus-side schema validator from fr_6e42567d Mode B) treat as
+        # authoritative.
+        _list_aspect_element_types: dict[str, tuple[type, ...]] = {
+            "examples": (dict,),
+            "pairs_with": (str,),
+            "not_appropriate_for": (str,),
+        }
+        for aspect_name, allowed_elem_types in _list_aspect_element_types.items():
             value = getattr(self, aspect_name)
             if value is None:
                 setattr(self, aspect_name, [])
@@ -188,6 +206,14 @@ class Skill:
                     f"Skill {aspect_name!r} must be a list (got "
                     f"{type(value).__name__}: {value!r})."
                 )
+            elem_type_name = "/".join(t.__name__ for t in allowed_elem_types)
+            for idx, elem in enumerate(value):
+                if not isinstance(elem, allowed_elem_types):
+                    raise TypeError(
+                        f"Skill {aspect_name!r} entry {idx} must be "
+                        f"{elem_type_name} (got "
+                        f"{type(elem).__name__}: {elem!r})."
+                    )
 
         # ``examples`` is deep-copied because each entry is a dict
         # with nested ``input_args`` / ``expected_output_shape``

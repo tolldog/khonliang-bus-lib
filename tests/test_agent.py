@@ -1223,6 +1223,75 @@ async def test_help_explicit_none_detail_aspect_use_defaults(aspect_agent):
     assert "aspect" not in result
 
 
+def test_skill_aspect_fields_are_keyword_only_preserving_positional_order():
+    """Pre-aspect call sites passed up to ``default_timeout_s``
+    positionally. Adding new positional fields after it would
+    silently bind the timeout's value to ``prompt``. Aspect fields
+    are ``kw_only=True`` so existing positional calls still work."""
+    # Reproduces a positional call that includes default_timeout_s
+    # in its expected slot. If the new aspect fields were positional,
+    # the 14th positional arg (5.0) would bind to ``prompt``
+    # instead of ``default_timeout_s``.
+    s = Skill(
+        "x",                       # name
+        "desc",                    # description
+        {"q": {"type": "string"}}, # parameters
+        "1.0.0",                   # since
+        "x.do",                    # capability
+        {},                        # input_schema
+        None,                      # output_contract
+        "authoritative",           # authority
+        "active",                  # status
+        ["alias_x"],               # aliases
+        [],                        # execution_profiles
+        None,                      # runtime_profile
+        {},                        # metadata
+        5.0,                       # default_timeout_s
+    )
+    assert s.default_timeout_s == 5.0
+    # New aspect fields stay at their defaults; the positional 5.0
+    # bound to default_timeout_s, not prompt.
+    assert s.prompt == ""
+    assert s.examples == []
+
+    # And new aspect fields can only be passed by keyword.
+    with pytest.raises(TypeError):
+        Skill("x", "d", {}, "", "", {}, None, "authoritative", "active",
+              [], [], None, {}, None, "would-be-prompt-positional")  # noqa: E501
+
+
+def test_skill_rejects_non_str_pairs_with_elements():
+    """``pairs_with: list[str]`` — element types are validated.
+    A stray int or dict in the list would corrupt the registration
+    payload that downstream ``help`` consumers treat as authoritative."""
+    for bad_elem in (1, {"wrong": "shape"}, None, True):
+        with pytest.raises(TypeError) as exc_info:
+            Skill(name="x", pairs_with=["good", bad_elem])  # type: ignore[list-item]
+        msg = str(exc_info.value)
+        assert "pairs_with" in msg
+        assert "entry 1" in msg
+        assert "str" in msg
+
+
+def test_skill_rejects_non_str_not_appropriate_for_elements():
+    """Same per-element guard for ``not_appropriate_for``."""
+    with pytest.raises(TypeError) as exc_info:
+        Skill(name="x", not_appropriate_for=[42])  # type: ignore[list-item]
+    assert "not_appropriate_for" in str(exc_info.value)
+    assert "entry 0" in str(exc_info.value)
+
+
+def test_skill_rejects_non_dict_examples_elements():
+    """``examples: list[dict]`` — non-dict entries fail loudly."""
+    for bad_elem in ("string-not-dict", 42, ["nested-list"]):
+        with pytest.raises(TypeError) as exc_info:
+            Skill(name="x", examples=[bad_elem])  # type: ignore[list-item]
+        msg = str(exc_info.value)
+        assert "examples" in msg
+        assert "entry 0" in msg
+        assert "dict" in msg
+
+
 def test_skill_rejects_non_str_prompt():
     """``prompt`` must be ``str`` (None coerces to ""). Other
     types — bool, int, list, dict — fail loudly at construction

@@ -1489,7 +1489,10 @@ async def test_strict_args_rejects_missing_required_arg(strict_agent):
 @pytest.mark.asyncio
 async def test_strict_args_rejects_wrong_type(strict_agent):
     """Type mismatch surfaces declared and actual types so the caller
-    can correct without re-reading the schema."""
+    can correct without re-reading the schema. The OFFENDING VALUE is
+    deliberately NOT in the error envelope — it could be a 50KB blob
+    or sensitive content (API keys, paper text, user PII) and would
+    otherwise leak into bus responses + downstream logs."""
     result = await strict_agent._dispatch_request({
         "operation": "strict_echo",
         "args": {"text": 42},
@@ -1497,6 +1500,29 @@ async def test_strict_args_rejects_wrong_type(strict_agent):
     assert "error" in result
     assert "string" in result["error"]
     assert "int" in result["error"]
+    # The bad value (42) must NOT appear in the error — leakage guard.
+    assert "42" not in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_strict_args_does_not_leak_large_payload_in_error(strict_agent):
+    """Real-world version of the leakage guard: caller passes a large
+    string where a non-string type is expected. The error message stays
+    bounded — only declared / actual type names — so a multi-KB
+    payload never lands in the bus response or downstream logs."""
+    big_value = "X" * 5000  # 5KB; could just as easily be 50KB
+    result = await strict_agent._dispatch_request({
+        "operation": "strict_count",
+        "args": {"n": big_value},
+    })
+    assert "error" in result
+    # Error length is bounded regardless of input value size.
+    assert len(result["error"]) < 200, (
+        f"error grew with value size — likely leaking value: "
+        f"{result['error'][:200]}..."
+    )
+    assert "integer" in result["error"]
+    assert big_value not in result["error"]
 
 
 @pytest.mark.asyncio
@@ -1649,6 +1675,25 @@ def test_strict_args_serializes_only_when_true():
     off = Skill(name="y", parameters={"q": {"type": "string"}})
     assert on.to_dict()["strict_args"] is True
     assert "strict_args" not in off.to_dict()
+
+
+def test_skill_rejects_non_bool_strict_args():
+    """``strict_args`` must be a real ``bool``. Truthy non-bool values
+    ('true', 1, [1]) silently enabling validation while ``to_dict()``
+    serializes them as ``True`` would mask the misuse from downstream
+    consumers reading the registration payload. Construction must
+    fail loudly for the same reason str-rejection covers the list-
+    aspects: a public flag deserves type-locked semantics."""
+    for bad in ("true", "false", 1, 0, [True], {"strict": True}):
+        with pytest.raises(TypeError) as exc_info:
+            Skill(name="x", strict_args=bad)  # type: ignore[arg-type]
+        msg = str(exc_info.value)
+        assert "strict_args" in msg
+        assert "bool" in msg
+        assert type(bad).__name__ in msg
+    # Real bools accepted on either side.
+    Skill(name="ok_true", strict_args=True)
+    Skill(name="ok_false", strict_args=False)
 
 
 @pytest.mark.asyncio

@@ -261,6 +261,17 @@ class Skill:
                 )
             self.default_timeout_s = float(self.default_timeout_s)
         self.metadata = dict(self.metadata)
+        # ``strict_args`` is a public flag that gates bus-side
+        # validation; a truthy non-bool ('true', 1, etc.) would
+        # silently turn validation on while ``to_dict()`` serializes
+        # it as boolean True, masking the misuse from downstream
+        # consumers reading the registration payload. Type-check
+        # explicitly so misuse fails at construction.
+        if not isinstance(self.strict_args, bool):
+            raise TypeError(
+                f"Skill strict_args must be a bool (got "
+                f"{type(self.strict_args).__name__}: {self.strict_args!r})."
+            )
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the skill for bus registration.
@@ -306,10 +317,11 @@ class Skill:
             for key, value in optional.items()
             if value not in (None, "", [], {})
         })
-        # ``strict_args`` is included only when True so it stays
-        # signal-dense (matches the existing optional-field convention)
-        # but a lurking bool=False false-default in the dict-comprehension
-        # filter above would have dropped True alongside False.
+        # Omit ``strict_args`` when False so the registration payload
+        # stays signal-dense (matches the existing optional-field
+        # convention — the dict-comprehension filter above doesn't
+        # cover bool because both True and False are outside its
+        # ``(None, "", [], {})`` skip-set).
         if self.strict_args:
             payload["strict_args"] = True
         return payload
@@ -1301,10 +1313,18 @@ class BaseAgent:
                 continue
             value = args[field_name]
             if not cls._SCHEMA_TYPE_CHECKS[declared_type](value):
+                # Surface the declared and actual types only — NOT the
+                # value itself. Validation errors flow through the bus
+                # response envelope and into logs; echoing the offending
+                # value would leak large payloads (the same args path
+                # carries 50KB messages, paper PDFs, etc.) and any
+                # sensitive content (API keys, paper text, user PII)
+                # into downstream storage / context windows. The caller
+                # already has the value; the error only needs to tell
+                # them which arg + what shape was expected.
                 return (
                     f"arg {field_name!r} for {skill.name!r} must be "
-                    f"{declared_type} (got "
-                    f"{type(value).__name__}: {value!r})."
+                    f"{declared_type} (got {type(value).__name__})."
                 )
         return None
 

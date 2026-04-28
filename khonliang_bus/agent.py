@@ -37,6 +37,7 @@ import os
 import signal
 import sys
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
@@ -120,6 +121,23 @@ class Skill:
     # Appended at the end of the field list to preserve positional-arg
     # compatibility for existing ``Skill(...)`` call sites.
     default_timeout_s: float | None = None
+    # Multi-aspect introspection fields (fr_khonliang-bus-lib_6e42567d).
+    # All optional; agents populate the ones that are useful for
+    # cold-start LLM consumers and for sibling-agent calls. Each
+    # aspect is exposed via the ``help(skills, aspect=…)`` skill
+    # (fr_khonliang-bus-lib_42555320) so a consumer can ask for the
+    # exact slice they need without paying for the full SkillEntry.
+    #
+    # ``kw_only=True`` so adding these fields doesn't shift the
+    # positional-arg signature: existing call sites that passed
+    # ``default_timeout_s`` (or any prior optional) positionally
+    # still bind correctly. Any caller that wants the new fields
+    # passes them by keyword, which is the only sensible shape for
+    # editorial metadata anyway.
+    prompt: str = field(default="", kw_only=True)
+    examples: list[dict[str, Any]] = field(default_factory=list, kw_only=True)
+    pairs_with: list[str] = field(default_factory=list, kw_only=True)
+    not_appropriate_for: list[str] = field(default_factory=list, kw_only=True)
 
     def __post_init__(self) -> None:
         # Deep-copy so per-parameter nested dicts (type/default/description
@@ -128,8 +146,6 @@ class Skill:
         # without deepcopy, a caller mutating ``params['detail']['default']``
         # on one clone would silently corrupt ``BUILT_IN_SKILLS`` for every
         # subsequent call (and every other agent in the process).
-        from copy import deepcopy
-
         self.parameters = deepcopy(dict(self.parameters))
         self.input_schema = deepcopy(dict(self.input_schema or self.parameters))
         if self.output_contract is not None:
@@ -141,6 +157,74 @@ class Skill:
         self.authority = SkillAuthority.coerce(self.authority)
         self.status = SkillStatus.coerce(self.status)
         self.aliases = list(self.aliases)
+        # Aspect-field coercion. The type guards are deliberate: these
+        # fields ride the registration payload and surface through the
+        # ``help`` skill, so silent type drift (a stray ``False`` or
+        # ``{}``) would corrupt the discoverability output for every
+        # downstream consumer. Each guard fails loudly at construction
+        # rather than letting a misuse propagate.
+        #
+        # ``prompt`` must be ``str`` (None coerces to "" — JSON null
+        # for an unset aspect).
+        if self.prompt is None:
+            self.prompt = ""
+        elif not isinstance(self.prompt, str):
+            raise TypeError(
+                f"Skill prompt must be a str (got "
+                f"{type(self.prompt).__name__}: {self.prompt!r})."
+            )
+
+        # List-aspects must be ``list`` of the right element type
+        # (None coerces to []). ``str`` gets a specific outer-container
+        # hint because ``list('foo')`` silently splits into
+        # ``['f','o','o']`` (the easy JSON / CLI mistake); every other
+        # non-list type is rejected as the generic "expected list, got
+        # X" case so dict / bool / int / etc. can't sneak through.
+        # Element types are validated too — a stray non-string in
+        # ``pairs_with`` or non-dict in ``examples`` would corrupt the
+        # registration payload that downstream consumers (the ``help``
+        # skill, sibling agents reading aspect=schema, the future
+        # bus-side schema validator from fr_6e42567d Mode B) treat as
+        # authoritative.
+        _list_aspect_element_types: dict[str, tuple[type, ...]] = {
+            "examples": (dict,),
+            "pairs_with": (str,),
+            "not_appropriate_for": (str,),
+        }
+        for aspect_name, allowed_elem_types in _list_aspect_element_types.items():
+            value = getattr(self, aspect_name)
+            if value is None:
+                setattr(self, aspect_name, [])
+                continue
+            if isinstance(value, str):
+                raise TypeError(
+                    f"Skill {aspect_name!r} must be a list (got str). "
+                    f"Wrap a single entry in a list: {aspect_name}=[{value!r}]."
+                )
+            if not isinstance(value, list):
+                raise TypeError(
+                    f"Skill {aspect_name!r} must be a list (got "
+                    f"{type(value).__name__}: {value!r})."
+                )
+            elem_type_name = "/".join(t.__name__ for t in allowed_elem_types)
+            for idx, elem in enumerate(value):
+                if not isinstance(elem, allowed_elem_types):
+                    raise TypeError(
+                        f"Skill {aspect_name!r} entry {idx} must be "
+                        f"{elem_type_name} (got "
+                        f"{type(elem).__name__}: {elem!r})."
+                    )
+
+        # ``examples`` is deep-copied because each entry is a dict
+        # with nested ``input_args`` / ``expected_output_shape``
+        # shapes — a shallow copy would still alias the inner dicts
+        # to the caller's literals. The simpler list-of-strings
+        # aspects only need a shallow ``list(...)`` of the outer
+        # list. After the type guards above, empty lists round-trip
+        # cleanly through both calls (``deepcopy([]) == []``).
+        self.examples = deepcopy(self.examples)
+        self.pairs_with = list(self.pairs_with)
+        self.not_appropriate_for = list(self.not_appropriate_for)
         self.execution_profiles = [
             profile
             if isinstance(profile, ExecutionProfile)
@@ -204,6 +288,10 @@ class Skill:
             ),
             "default_timeout_s": self.default_timeout_s,
             "metadata": self.metadata,
+            "prompt": self.prompt,
+            "examples": self.examples,
+            "pairs_with": self.pairs_with,
+            "not_appropriate_for": self.not_appropriate_for,
         }
         payload.update({
             key: value
@@ -458,6 +546,55 @@ class BaseAgent:
                 },
             },
         ),
+        Skill(
+            name="help",
+            description=(
+                "Per-skill introspection: arg schema + descriptive "
+                "info + (when populated) prompt template / examples / "
+                "pairs_with / not_appropriate_for. Pass ``skill_names`` "
+                "for batch lookup or ``[]`` for the full catalog. Use "
+                "``aspect=`` for fine-grained reads (one field per "
+                "skill). Always available."
+            ),
+            parameters={
+                "skill_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "default": [],
+                    "description": (
+                        "Names to look up. Empty list returns every "
+                        "registered skill on this agent. Unknown "
+                        "names appear in the response with "
+                        "``found: false`` rather than being dropped."
+                    ),
+                },
+                "detail": {
+                    "type": "string",
+                    "default": "brief",
+                    "description": (
+                        "compact (name + description) | brief (+ "
+                        "parameters + input_schema + capability when "
+                        "set) | full (+ aliases + since + populated "
+                        "aspect fields: prompt / examples / "
+                        "pairs_with / not_appropriate_for)"
+                    ),
+                },
+                "aspect": {
+                    "type": "string",
+                    "default": "",
+                    "description": (
+                        "Optional aspect-mode read. One of: brief, "
+                        "help, schema, prompt, examples, pairs_with, "
+                        "not_appropriate_for. When set, response is a "
+                        "flat list of ``{name, found, value}`` entries "
+                        "carrying just the requested aspect — token-"
+                        "efficient for callers that already know what "
+                        "slice they need (e.g. an LLM asking for "
+                        "``prompt`` to adapt a template)."
+                    ),
+                },
+            },
+        ),
     )
 
     # Subclasses override this class attribute to provide editorial
@@ -682,6 +819,176 @@ class BaseAgent:
                 prefix = "misc"
             groups.setdefault(prefix, []).append(s)
         return dict(sorted(groups.items()))
+
+    # -- help skill (fr_khonliang-bus-lib_42555320 + 6e42567d) --
+
+    # Aspect → Skill-attribute mapping consumed by ``handle_help``'s
+    # aspect-mode short-circuit. Centralized so each aspect has one
+    # definition shared between schema validation and response
+    # construction. ``brief`` and ``help`` reuse ``description`` —
+    # bus-lib v1 doesn't separate one-line / long-form prose; when
+    # a future Phase parses docstring sections (``Notes:``, ``Raises:``,
+    # etc.) the ``help`` aspect will route to that richer field.
+    _ASPECT_FIELDS: dict[str, str] = {
+        "brief": "description",
+        "help": "description",
+        "schema": "input_schema",
+        "prompt": "prompt",
+        "examples": "examples",
+        "pairs_with": "pairs_with",
+        "not_appropriate_for": "not_appropriate_for",
+    }
+
+    @handler("help")
+    async def handle_help(self, args: dict) -> dict:
+        """Per-skill introspection — arg schema + descriptive info.
+
+        Two response modes:
+
+        - **SkillEntry mode** (``aspect=`` empty): returns a list of
+          ``SkillEntry`` dicts with the canonical name, description,
+          arguments (parameters / input_schema), and any populated
+          aspect fields. ``detail=compact|brief|full`` selects how
+          much to include.
+
+        - **Aspect mode** (``aspect=brief|help|schema|prompt|examples|
+          pairs_with|not_appropriate_for``): returns a flat list of
+          ``{name, found, value}`` per requested skill, carrying just
+          the requested aspect. Token-efficient for callers that
+          already know which slice they need (e.g. an LLM asking for
+          ``prompt`` to adapt a template).
+
+        Unknown skill names appear in the response with
+        ``found: false`` rather than being dropped, so the caller
+        learns which names missed.
+
+        ``skill_names=[]`` is shorthand for "every registered skill on
+        this agent" — equivalent to a full catalog dump.
+        """
+        raw_names = args.get("skill_names", [])
+        if not isinstance(raw_names, list):
+            return {
+                "error": (
+                    f"skill_names must be a list (got "
+                    f"{type(raw_names).__name__})"
+                )
+            }
+        skill_names = [str(n) for n in raw_names]
+
+        # Defaulting: only treat ``None`` as "not provided". Falsey
+        # values like ``0`` / ``False`` are caller-supplied bad values
+        # and should hit the validation envelope below — falsey-coalesce
+        # would silently substitute the default and mask the bug. The
+        # post-strip ``or default`` is narrow: only kicks in when the
+        # caller passed an explicit empty/whitespace string, matching
+        # ``handle_welcome``'s convention.
+        raw_detail = args.get("detail")
+        if raw_detail is None:
+            detail = "brief"
+        else:
+            detail = str(raw_detail).strip().lower() or "brief"
+        if detail not in {"compact", "brief", "full"}:
+            return {"error": f"detail must be one of compact|brief|full (got {detail!r})"}
+
+        raw_aspect = args.get("aspect")
+        if raw_aspect is None:
+            aspect = ""
+        else:
+            aspect = str(raw_aspect).strip().lower()
+        if aspect and aspect not in self._ASPECT_FIELDS:
+            allowed = "|".join(sorted(self._ASPECT_FIELDS))
+            return {"error": f"aspect must be one of {allowed} (got {aspect!r})"}
+
+        skills = self._all_skills()
+        by_name = {s.name: s for s in skills}
+
+        # Empty list = full catalog. Sort alphabetically here for
+        # determinism — ``_all_skills`` itself preserves subclass
+        # registration order followed by ``BUILT_IN_SKILLS`` tuple
+        # order, which would surface different orderings to different
+        # agents. Sorting once at the response-shaping step gives a
+        # stable, comparable catalog across the fleet without forcing
+        # ``_all_skills`` callers (e.g. categorization, welcome) to pay
+        # for ordering they don't need.
+        if not skill_names:
+            target_names = sorted(by_name)
+        else:
+            target_names = skill_names
+
+        # Aspect-mode short-circuit: flat list keyed by skill name.
+        if aspect:
+            attr = self._ASPECT_FIELDS[aspect]
+            results = []
+            for name in target_names:
+                skill = by_name.get(name)
+                if skill is None:
+                    results.append({
+                        "name": name,
+                        "found": False,
+                        "reason": "no skill with that name on this agent",
+                    })
+                    continue
+                value = getattr(skill, attr)
+                # ``schema`` resolves to input_schema; fall back to
+                # parameters when input_schema is empty (the default
+                # for legacy Skill registrations that only set
+                # parameters).
+                if aspect == "schema" and not value:
+                    value = skill.parameters
+                results.append({
+                    "name": name,
+                    "found": True,
+                    "value": value,
+                })
+            return {"aspect": aspect, "skills": results}
+
+        # SkillEntry mode.
+        entries = []
+        for name in target_names:
+            skill = by_name.get(name)
+            if skill is None:
+                entries.append({
+                    "name": name,
+                    "found": False,
+                    "reason": "no skill with that name on this agent",
+                })
+                continue
+            entry: dict[str, Any] = {
+                "name": skill.name,
+                "found": True,
+                "description": skill.description,
+            }
+            if detail in {"brief", "full"}:
+                entry["parameters"] = skill.parameters
+                # Surface input_schema only when it diverges from
+                # ``parameters`` (matches the registration-payload
+                # convention in ``Skill.to_dict``).
+                if skill.input_schema and skill.input_schema != skill.parameters:
+                    entry["input_schema"] = skill.input_schema
+                if skill.capability:
+                    entry["capability"] = skill.capability
+            if detail == "full":
+                # Aspect fields are advisory; emit only when populated
+                # so the response stays signal-dense for skills that
+                # don't bother declaring them.
+                if skill.prompt:
+                    entry["prompt"] = skill.prompt
+                if skill.examples:
+                    entry["examples"] = skill.examples
+                if skill.pairs_with:
+                    entry["pairs_with"] = skill.pairs_with
+                if skill.not_appropriate_for:
+                    entry["not_appropriate_for"] = skill.not_appropriate_for
+                if skill.aliases:
+                    entry["aliases"] = skill.aliases
+                if skill.since:
+                    entry["since"] = skill.since
+            entries.append(entry)
+        return {
+            "agent_id": self.agent_id,
+            "agent_type": self.agent_type,
+            "skills": entries,
+        }
 
     @handler("health_check")
     async def handle_health_check(self, args: dict) -> dict:

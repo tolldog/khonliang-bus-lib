@@ -2052,10 +2052,13 @@ async def test_request_typed_falls_back_when_schema_fetch_fails(agent, caplog):
 
 @pytest.mark.asyncio
 async def test_request_typed_caches_negative_lookup_to_avoid_retry_storm(agent):
-    """When schema fetch fails, the cache stores an empty dict (the
-    "couldn't fetch" sentinel) so subsequent typed calls don't retry
-    help() on every dispatch. The caller must explicitly
-    ``invalidate_schema_cache`` to force a fresh attempt."""
+    """When schema fetch fails, the cache stores the
+    ``_SCHEMA_FETCH_FAILED`` sentinel so subsequent typed calls don't
+    retry help() on every dispatch. The caller must explicitly
+    ``invalidate_schema_cache`` to force a fresh attempt. The sentinel
+    is distinct from ``{}`` so a legitimately empty schema (zero-args
+    contract) still validates locally — see
+    ``test_request_typed_validates_against_empty_schema``."""
     fail_count = 0
 
     class _OneFailHelp:
@@ -2353,3 +2356,94 @@ async def test_request_typed_handles_realistic_bus_envelope_with_extra_keys(agen
     assert result["result"] == {"findings": []}
     assert result["trace_id"] == "t-def456"
     assert fake.calls == ["help", "review_diff"]
+
+
+@pytest.mark.asyncio
+async def test_request_typed_validates_against_empty_schema(agent):
+    """An empty schema ``{}`` is a valid zero-args contract under
+    ``strict_args=True`` — caller-side validation must reject any
+    kwargs locally rather than treating ``{}`` as "no schema". This
+    pins the negative-cache sentinel as distinct from a real empty
+    schema (Copilot pass-1 finding on PR#23)."""
+    fake = _FakeBusHTTP({
+        "help": _help_schema_response("ping", {}),
+    })
+    agent._http = fake
+    result = await agent.request_typed(
+        agent_type="reviewer", operation="ping", args={"unexpected": "kw"},
+    )
+    # Local rejection — empty-schema marker, no remote dispatch.
+    assert "error" in result
+    assert "empty schema" in result["error"]
+    assert fake.operations_called == ["help"]
+
+
+@pytest.mark.asyncio
+async def test_request_typed_empty_schema_passes_zero_args_through(agent):
+    """The empty-schema contract still allows the no-arg call: when
+    args is ``None`` (or ``{}``), validation passes and the request
+    is dispatched. This is the other side of the empty-schema
+    contract — empty in, empty out."""
+    fake = _FakeBusHTTP({
+        "help": _help_schema_response("ping", {}),
+        "ping": {"result": {"pong": True}},
+    })
+    agent._http = fake
+    result = await agent.request_typed(
+        agent_type="reviewer", operation="ping", args=None,
+    )
+    assert result == {"result": {"pong": True}}
+    assert fake.operations_called == ["help", "ping"]
+
+
+@pytest.mark.asyncio
+async def test_request_typed_negative_cache_sentinel_distinct_from_empty_schema(agent):
+    """The "fetch failed" sentinel must not be ``{}`` — otherwise a
+    legitimately empty schema would mask validation. After a failed
+    fetch and a subsequent successful one (post-invalidation) for an
+    empty-schema skill, kwargs should be rejected locally — proving
+    the cache state was the failure sentinel, not an empty schema."""
+    call_count = {"help": 0}
+
+    class _FlipFlopHTTP:
+        def __init__(self):
+            self.calls: list[str] = []
+
+        async def post(self_inner, url, *, json=None, timeout=None):
+            op = (json or {}).get("operation", "")
+            self_inner.calls.append(op)
+            if op == "help":
+                call_count["help"] += 1
+                if call_count["help"] == 1:
+                    raise RuntimeError("transient")
+                resp = _help_schema_response("ping", {})
+            else:
+                resp = {"result": {"pong": True}}
+
+            class _R:
+                def json(self):
+                    return resp
+
+            return _R()
+
+        async def aclose(self):
+            pass
+
+    fake = _FlipFlopHTTP()
+    agent._http = fake
+
+    # First call: fetch fails, sentinel cached, dispatch falls through.
+    r1 = await agent.request_typed(
+        agent_type="reviewer", operation="ping", args={"k": "v"},
+    )
+    assert r1 == {"result": {"pong": True}}
+
+    # Invalidate so the next call refetches; empty schema returns this time.
+    agent.invalidate_schema_cache("reviewer", "ping")
+
+    # Second call: schema = {}, kwargs must be rejected locally.
+    r2 = await agent.request_typed(
+        agent_type="reviewer", operation="ping", args={"k": "v"},
+    )
+    assert "error" in r2
+    assert "empty schema" in r2["error"]

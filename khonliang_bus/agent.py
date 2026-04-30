@@ -374,6 +374,16 @@ class WelcomeEntryPoint:
 _EMPTY_DELEGATES: Mapping[str, str] = MappingProxyType({})
 
 
+# Sentinel for ``request_typed``'s remote-schema cache. A fetch
+# failure stores this object so the cache hit short-circuits
+# without retrying, while staying distinguishable from a
+# legitimately empty schema ``{}`` (a zero-args contract under
+# ``strict_args=True``). Using ``object()`` rather than ``None``
+# or ``{}`` keeps "fetch failed" non-aliasable with any valid
+# schema value a remote agent might declare.
+_SCHEMA_FETCH_FAILED: Any = object()
+
+
 @dataclass(frozen=True)
 class Welcome:
     """Editorial agent introduction for the cold-start ``welcome`` skill.
@@ -1491,18 +1501,25 @@ class BaseAgent:
             )
             # Stampede guard: two coroutines on the same uncached
             # key can both miss and both fetch; only the first
-            # write wins. ``cache_key not in cache`` (not
-            # ``cache.get is None``) keeps the first-writer's
-            # result so subsequent typed calls see consistent
-            # state. ``None`` from the fetch is the "couldn't
-            # fetch" sentinel; we cache ``{}`` instead so
-            # subsequent calls don't retry on every dispatch
-            # (avoiding retry storms).
+            # write wins (``cache_key not in cache`` re-check
+            # keeps the first-writer's result so subsequent
+            # typed calls see consistent state). ``None`` from
+            # the fetch means "couldn't fetch" — we cache the
+            # ``_SCHEMA_FETCH_FAILED`` sentinel so subsequent
+            # calls short-circuit without retrying (avoiding
+            # retry storms) while staying distinguishable from
+            # a legitimately empty schema ``{}`` (a valid
+            # zero-args contract under ``strict_args=True``).
             if cache_key not in cache:
-                cache[cache_key] = fetched if fetched is not None else {}
+                cache[cache_key] = (
+                    fetched if fetched is not None else _SCHEMA_FETCH_FAILED
+                )
         schema = cache[cache_key]
 
-        if schema:
+        # Validate whenever the schema was successfully fetched —
+        # even ``{}`` (zero-args contract). Only the explicit
+        # fetch-failure sentinel skips validation.
+        if schema is not _SCHEMA_FETCH_FAILED:
             # Synthesize a minimal Skill so the existing validator
             # can be reused verbatim — same error shape as the
             # dispatcher-side path, same field-name semantics.
@@ -1547,9 +1564,12 @@ class BaseAgent:
         round-trip — every fleet agent inherits help from bus-lib
         (fr_khonliang-bus-lib_42555320), so this works without
         per-agent cooperation. Returns the schema dict on success
+        (including ``{}`` when the skill genuinely takes no args)
         or ``None`` on any of: help skill unavailable, operation
-        unknown on target, transport error. The caller caches
-        ``None`` as an empty dict to avoid retry storms.
+        unknown on target, transport error. The caller maps
+        ``None`` to the ``_SCHEMA_FETCH_FAILED`` sentinel in the
+        cache to short-circuit retries while staying distinct
+        from a real empty schema.
         """
         try:
             response = await self.request(

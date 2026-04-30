@@ -2447,3 +2447,216 @@ async def test_request_typed_negative_cache_sentinel_distinct_from_empty_schema(
     )
     assert "error" in r2
     assert "empty schema" in r2["error"]
+
+
+@pytest.mark.asyncio
+async def test_request_typed_stampede_real_schema_overwrites_failure_sentinel(agent):
+    """Concurrent stampede recovery: when one sibling coroutine
+    writes the failure sentinel before another's successful fetch
+    lands, the successful fetch must overwrite the sentinel rather
+    than silently losing the schema. Otherwise a transient sibling
+    failure would poison the cache for an in-flight success until
+    manual ``invalidate_schema_cache`` (Copilot pass-2 finding)."""
+    # Pre-populate the cache with the failure sentinel by hand,
+    # then call request_typed — the path should run a fresh fetch
+    # because the key check uses ``cache_key not in cache``... but
+    # the key IS in cache (with the sentinel). So this test
+    # exercises the in-method overwrite branch by simulating two
+    # interleaved fetches: we manually set the sentinel after the
+    # first fetch starts but before its write lands.
+    from khonliang_bus.agent import _SCHEMA_FETCH_FAILED
+
+    schema = {"diff": {"type": "string", "required": True}}
+    real_schema_response = _help_schema_response("review_diff", schema)
+
+    # Wire up a fake HTTP that returns the real schema, but right
+    # before request_typed writes the cache, a "sibling" injects
+    # the failure sentinel into the cache slot. The fix should
+    # detect the sentinel and overwrite it with the real schema.
+    sibling_injected = False
+
+    class _RaceyHTTP:
+        def __init__(self):
+            self.calls: list[str] = []
+
+        async def post(self_inner, url, *, json=None, timeout=None):
+            nonlocal sibling_injected
+            op = (json or {}).get("operation", "")
+            self_inner.calls.append(op)
+            if op == "help" and not sibling_injected:
+                # Inject the sibling's failure sentinel into the
+                # cache before we return — simulates a concurrent
+                # coroutine that lost the race to the failure side.
+                # ``request_typed`` has already populated
+                # ``_remote_schema_cache`` (line 1495-1496), so we
+                # mutate it in place — assignment via
+                # ``= getattr(...) or {}`` would silently swap the
+                # dict because ``{}`` is falsy, breaking the
+                # caller's local-variable identity.
+                agent._remote_schema_cache[("reviewer", "review_diff")] = (
+                    _SCHEMA_FETCH_FAILED
+                )
+                sibling_injected = True
+                resp = real_schema_response
+            else:
+                resp = {"result": {"ok": True}}
+
+            class _R:
+                def json(self):
+                    return resp
+
+            return _R()
+
+        async def aclose(self):
+            pass
+
+    fake = _RaceyHTTP()
+    agent._http = fake
+
+    # First call: our fetch succeeds, the "sibling" wrote the
+    # sentinel mid-fetch. Our fix must overwrite it.
+    result = await agent.request_typed(
+        agent_type="reviewer",
+        operation="review_diff",
+        args={"diff": "hello"},
+    )
+    # Successful real-schema overwrite — call dispatched, no error.
+    assert result == {"result": {"ok": True}}
+    # Cache now holds the real schema, not the sentinel.
+    cached = agent._remote_schema_cache[("reviewer", "review_diff")]
+    assert cached == schema
+    assert cached is not _SCHEMA_FETCH_FAILED
+
+
+@pytest.mark.asyncio
+async def test_request_typed_real_schema_not_overwritten_by_sentinel(agent):
+    """Inverse of the stampede recovery test: when the cache already
+    holds a real schema, a subsequent failed fetch must NOT
+    overwrite it with the sentinel. This pins the asymmetric
+    overwrite policy — sentinel→real upgrades, real→sentinel
+    downgrades are blocked."""
+    from khonliang_bus.agent import _SCHEMA_FETCH_FAILED
+
+    schema = {"diff": {"type": "string", "required": True}}
+    # Hand-prime the cache with a real schema, then simulate the
+    # mid-fetch overwrite path: another fetch failing while the
+    # cache already holds a successful schema.
+    agent._remote_schema_cache = {("reviewer", "review_diff"): schema}
+
+    # request_typed will see the key already in cache (real schema)
+    # and skip the fetch entirely — that's the correct fast path.
+    # To exercise the "real schema present + new failure" branch
+    # explicitly, we drive the in-method overwrite logic by hand
+    # via a second concurrent simulation: clear the entry, then
+    # have the help fetch fail while a sibling has already written
+    # a real schema before our write lands.
+    sibling_wrote_real = False
+
+    class _SiblingWritesRealHTTP:
+        async def post(self_inner, url, *, json=None, timeout=None):
+            nonlocal sibling_wrote_real
+            op = (json or {}).get("operation", "")
+            if op == "help" and not sibling_wrote_real:
+                # Sibling injects a real schema before our failure lands.
+                agent._remote_schema_cache[("reviewer", "review_diff")] = (
+                    schema
+                )
+                sibling_wrote_real = True
+                raise RuntimeError("our fetch fails")
+
+            class _R:
+                def json(self):
+                    return {"result": {"ok": True}}
+
+            return _R()
+
+        async def aclose(self):
+            pass
+
+    # Clear cache so request_typed will fetch.
+    agent._remote_schema_cache.clear()
+    agent._http = _SiblingWritesRealHTTP()
+
+    # Our fetch fails (raises) → returns None → caller would write
+    # sentinel. But sibling wrote a real schema mid-flight. The
+    # asymmetric-overwrite logic must keep the real schema.
+    result = await agent.request_typed(
+        agent_type="reviewer",
+        operation="review_diff",
+        args={"diff": "x"},
+    )
+    # Real schema validated locally → call dispatched cleanly.
+    assert result == {"result": {"ok": True}}
+    cached = agent._remote_schema_cache[("reviewer", "review_diff")]
+    assert cached == schema
+    assert cached is not _SCHEMA_FETCH_FAILED
+
+
+@pytest.mark.asyncio
+async def test_fetch_remote_schema_warns_on_skill_not_found(agent, caplog):
+    """``_fetch_remote_skill_schema`` returning None silently for
+    ``found:false`` was a docstring/behavior drift (Copilot pass-2
+    finding). Now logs a single warning with the reason so operators
+    notice when typed-call validation is silently disabled. Spam is
+    bounded by the negative-cache: one warning per (agent_type, op)
+    until ``invalidate_schema_cache``."""
+    import logging
+
+    fake = _FakeBusHTTP({
+        "help": {
+            "result": {
+                "aspect": "schema",
+                "skills": [{
+                    "name": "review_diff", "found": False,
+                    "reason": "no skill with that name on this agent",
+                }],
+            },
+        },
+        "review_diff": {"result": {"ok": True}},
+    })
+    agent._http = fake
+
+    with caplog.at_level(logging.WARNING):
+        await agent.request_typed(
+            agent_type="reviewer", operation="review_diff",
+            args={"x": 1},
+        )
+
+    msgs = [r.message for r in caplog.records if "skill not found" in r.message]
+    assert msgs, "expected warning about skill not found"
+    assert "reviewer" in msgs[0]
+    assert "review_diff" in msgs[0]
+
+
+@pytest.mark.asyncio
+async def test_fetch_remote_schema_warns_on_non_dict_envelope(agent, caplog):
+    """Non-dict bus envelope (a list / scalar / None) is a transport
+    or upstream-bug signal. Log a warning rather than silently
+    dropping validation."""
+    import logging
+
+    class _NonDictHTTP:
+        async def post(self_inner, url, *, json=None, timeout=None):
+            op = (json or {}).get("operation", "")
+
+            class _R:
+                def json(self):
+                    if op == "help":
+                        return ["unexpected", "list", "shape"]
+                    return {"result": {"ok": True}}
+
+            return _R()
+
+        async def aclose(self):
+            pass
+
+    agent._http = _NonDictHTTP()
+
+    with caplog.at_level(logging.WARNING):
+        await agent.request_typed(
+            agent_type="reviewer", operation="review_diff", args={"x": 1},
+        )
+
+    msgs = [r.message for r in caplog.records if "non-dict envelope" in r.message]
+    assert msgs, "expected warning about non-dict envelope"
+    assert "list" in msgs[0]

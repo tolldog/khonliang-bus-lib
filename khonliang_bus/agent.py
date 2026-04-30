@@ -1499,21 +1499,29 @@ class BaseAgent:
             fetched = await self._fetch_remote_skill_schema(
                 agent_type, operation, timeout=timeout
             )
-            # Stampede guard: two coroutines on the same uncached
-            # key can both miss and both fetch; only the first
-            # write wins (``cache_key not in cache`` re-check
-            # keeps the first-writer's result so subsequent
-            # typed calls see consistent state). ``None`` from
-            # the fetch means "couldn't fetch" — we cache the
-            # ``_SCHEMA_FETCH_FAILED`` sentinel so subsequent
-            # calls short-circuit without retrying (avoiding
-            # retry storms) while staying distinguishable from
-            # a legitimately empty schema ``{}`` (a valid
+            new_value = (
+                fetched if fetched is not None else _SCHEMA_FETCH_FAILED
+            )
+            # Stampede guard: two coroutines on the same uncached key
+            # can both miss and both fetch. The first to return wins
+            # the slot, EXCEPT when the existing entry is the
+            # failure sentinel and we have a real schema — in that
+            # case overwrite, so a transient sibling failure can't
+            # poison the cache for a successful fetch in flight.
+            # Conversely, never overwrite a real schema with the
+            # sentinel. ``None`` from the fetch means "couldn't
+            # fetch" — cached as ``_SCHEMA_FETCH_FAILED`` so
+            # subsequent calls short-circuit without retrying
+            # (avoiding retry storms) while staying distinguishable
+            # from a legitimately empty schema ``{}`` (a valid
             # zero-args contract under ``strict_args=True``).
             if cache_key not in cache:
-                cache[cache_key] = (
-                    fetched if fetched is not None else _SCHEMA_FETCH_FAILED
-                )
+                cache[cache_key] = new_value
+            elif (
+                cache[cache_key] is _SCHEMA_FETCH_FAILED
+                and new_value is not _SCHEMA_FETCH_FAILED
+            ):
+                cache[cache_key] = new_value
         schema = cache[cache_key]
 
         # Validate whenever the schema was successfully fetched —
@@ -1590,8 +1598,17 @@ class BaseAgent:
         # normal envelope), a list, a scalar, or None for malformed /
         # unexpected responses. Reject anything that isn't a dict
         # before probing, so a downstream ``.get`` doesn't raise
-        # AttributeError out of the schema-fetch path.
+        # AttributeError out of the schema-fetch path. Warn on each
+        # non-dispatch outcome so the docstring's "fall through with
+        # a warning" promise holds for every return-None path, not
+        # just transport-exception. Spam is bounded by the caller's
+        # negative-cache: at most one warning per (agent_type, op).
         if not isinstance(response, dict):
+            logger.warning(
+                "request_typed: schema fetch for %s.%s returned non-dict "
+                "envelope (%s) — falling back to unvalidated dispatch.",
+                agent_type, operation, type(response).__name__,
+            )
             return None
 
         # The bus envelope wraps the actual response; the help skill's
@@ -1600,15 +1617,41 @@ class BaseAgent:
         # bus's response transform. Probe both.
         body = response.get("result", response)
         if not isinstance(body, dict):
+            logger.warning(
+                "request_typed: schema fetch for %s.%s returned non-dict "
+                "result body — falling back to unvalidated dispatch.",
+                agent_type, operation,
+            )
             return None
         skills = body.get("skills")
         if not isinstance(skills, list) or not skills:
+            logger.warning(
+                "request_typed: schema fetch for %s.%s missing 'skills' "
+                "list (target may not implement help skill) — falling "
+                "back to unvalidated dispatch.",
+                agent_type, operation,
+            )
             return None
         entry = skills[0]
         if not isinstance(entry, dict) or not entry.get("found"):
+            reason = (
+                entry.get("reason", "unknown skill")
+                if isinstance(entry, dict)
+                else "malformed help entry"
+            )
+            logger.warning(
+                "request_typed: schema fetch for %s.%s reports skill not "
+                "found (%s) — falling back to unvalidated dispatch.",
+                agent_type, operation, reason,
+            )
             return None
         value = entry.get("value")
         if not isinstance(value, dict):
+            logger.warning(
+                "request_typed: schema fetch for %s.%s returned non-dict "
+                "schema value — falling back to unvalidated dispatch.",
+                agent_type, operation,
+            )
             return None
         return value
 

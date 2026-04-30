@@ -1876,3 +1876,834 @@ async def test_strict_args_warns_when_skill_name_doesnt_match_handler(caplog):
         "strict_args=True" in rec.message and "declared_name" in rec.message
         for rec in caplog.records
     ), "expected warning naming the misregistered skill"
+
+
+# ---------------------------------------------------------------------------
+# request_typed — caller-side schema validation (Mode B caller side,
+# fr_khonliang-bus-lib_6e42567d)
+# ---------------------------------------------------------------------------
+
+
+class _FakeBusHTTP:
+    """Mock httpx-shaped client for ``BaseAgent.request`` / request_typed.
+
+    Records every POST with its payload and replays scripted responses
+    keyed on (operation). Lets the tests verify that request_typed
+    actually shortcuts to a help() lookup on first call, caches it,
+    and only dispatches the real op when the args validate.
+    """
+
+    def __init__(self, scripted_responses: dict[str, Any]):
+        self.scripted = scripted_responses
+        self.calls: list[dict[str, Any]] = []
+
+    async def post(self, url, *, json=None, timeout=None):
+        self.calls.append({"url": url, "json": json, "timeout": timeout})
+        # Pull the response keyed on the operation in the request body.
+        op = (json or {}).get("operation", "")
+        body = self.scripted.get(op, {"error": f"no scripted response for {op}"})
+
+        class _Resp:
+            def __init__(self, data):
+                self._data = data
+
+            def json(self):
+                return self._data
+
+        return _Resp(body)
+
+    async def aclose(self):
+        pass
+
+    @property
+    def operations_called(self) -> list[str]:
+        return [c["json"].get("operation", "") for c in self.calls]
+
+
+def _help_schema_response(op_name: str, schema: dict) -> dict:
+    """Build the bus-envelope response shape that ``_fetch_remote_skill_schema``
+    expects from a remote help() call."""
+    return {
+        "result": {
+            "aspect": "schema",
+            "skills": [{"name": op_name, "found": True, "value": schema}],
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_request_typed_validates_locally_before_remote_dispatch(agent):
+    """The caller-side counterpart to PR#22's dispatcher validation:
+    ``request_typed`` fetches the destination's schema, validates
+    locally, and short-circuits with an error envelope WITHOUT making
+    the real remote call. Saves the network round-trip for known-bad
+    calls AND surfaces silent-drop bugs at the call site."""
+    fake = _FakeBusHTTP({
+        "help": _help_schema_response(
+            "review_diff", {"diff": {"type": "string", "required": True}},
+        ),
+        # No scripted entry for review_diff — if validation worked,
+        # the test never reaches the dispatch path.
+    })
+    agent._http = fake
+
+    result = await agent.request_typed(
+        agent_type="reviewer",
+        operation="review_diff",
+        args={"text": "wrong key"},  # caller meant 'diff'
+    )
+
+    assert "error" in result
+    assert "text" in result["error"]
+    assert "diff" in result["error"]
+    # Exactly ONE call — the help() lookup. The dispatch was
+    # short-circuited by local validation.
+    assert fake.operations_called == ["help"]
+
+
+@pytest.mark.asyncio
+async def test_request_typed_dispatches_when_args_validate(agent):
+    """A well-formed call dispatches normally. The schema fetch + the
+    real dispatch produce two POSTs: help, then review_diff."""
+    fake = _FakeBusHTTP({
+        "help": _help_schema_response(
+            "review_diff", {"diff": {"type": "string", "required": True}},
+        ),
+        "review_diff": {"result": {"findings": []}},
+    })
+    agent._http = fake
+
+    result = await agent.request_typed(
+        agent_type="reviewer",
+        operation="review_diff",
+        args={"diff": "valid diff content"},
+    )
+
+    assert result == {"result": {"findings": []}}
+    assert fake.operations_called == ["help", "review_diff"]
+
+
+@pytest.mark.asyncio
+async def test_request_typed_caches_schema_across_calls(agent):
+    """Schema fetch happens once per ``(agent_type, operation)``;
+    subsequent typed calls reuse the cached schema. With three
+    well-formed calls, we expect: 1 help + 3 review_diff = 4 POSTs.
+    A naive implementation would call help on every dispatch."""
+    fake = _FakeBusHTTP({
+        "help": _help_schema_response(
+            "review_diff", {"diff": {"type": "string", "required": True}},
+        ),
+        "review_diff": {"result": {"ok": True}},
+    })
+    agent._http = fake
+
+    for _ in range(3):
+        await agent.request_typed(
+            agent_type="reviewer",
+            operation="review_diff",
+            args={"diff": "x"},
+        )
+
+    assert fake.operations_called == ["help", "review_diff", "review_diff", "review_diff"]
+
+
+@pytest.mark.asyncio
+async def test_request_typed_falls_back_when_schema_fetch_fails(agent, caplog):
+    """If the help() lookup blows up (target down, transport error,
+    help-skill missing on a legacy agent), validation skips with a
+    warning and the call falls through to the existing ``request``
+    path. Caller stays unblocked when validation infrastructure is
+    independently broken."""
+    import logging
+
+    class _FailingHelp:
+        def __init__(self):
+            self.calls = []
+
+        async def post(self, url, *, json=None, timeout=None):
+            self.calls.append((json or {}).get("operation"))
+            op = (json or {}).get("operation", "")
+            if op == "help":
+                raise RuntimeError("simulated transport failure")
+
+            class _Resp:
+                def json(self_inner):
+                    return {"result": {"ok": True}}
+
+            return _Resp()
+
+        async def aclose(self):
+            pass
+
+    fake = _FailingHelp()
+    agent._http = fake
+    with caplog.at_level(logging.WARNING):
+        result = await agent.request_typed(
+            agent_type="reviewer",
+            operation="review_diff",
+            args={"anything": "goes"},
+        )
+
+    # Warning surfaced; dispatch still happened (no validation gate).
+    assert any("schema fetch failed" in rec.message for rec in caplog.records)
+    assert result == {"result": {"ok": True}}
+    assert fake.calls == ["help", "review_diff"]
+
+
+@pytest.mark.asyncio
+async def test_request_typed_caches_negative_lookup_to_avoid_retry_storm(agent):
+    """When schema fetch fails, the cache stores the
+    ``_SCHEMA_FETCH_FAILED`` sentinel so subsequent typed calls don't
+    retry help() on every dispatch. The caller must explicitly
+    ``invalidate_schema_cache`` to force a fresh attempt. The sentinel
+    is distinct from ``{}`` so a legitimately empty schema (zero-args
+    contract) still validates locally — see
+    ``test_request_typed_validates_against_empty_schema``."""
+    fail_count = 0
+
+    class _OneFailHelp:
+        def __init__(self):
+            self.calls = []
+
+        async def post(self_inner, url, *, json=None, timeout=None):
+            nonlocal fail_count
+            op = (json or {}).get("operation", "")
+            self_inner.calls.append(op)
+            if op == "help":
+                fail_count += 1
+                raise RuntimeError("transient failure")
+
+            class _Resp:
+                def json(self):
+                    return {"result": {"ok": True}}
+
+            return _Resp()
+
+        async def aclose(self):
+            pass
+
+    fake = _OneFailHelp()
+    agent._http = fake
+    for _ in range(3):
+        await agent.request_typed(
+            agent_type="reviewer", operation="review_diff", args={"x": 1},
+        )
+    # Help called once (first call, cached negative); subsequent
+    # typed calls dispatched directly without re-fetching.
+    assert fail_count == 1
+    assert fake.calls == ["help", "review_diff", "review_diff", "review_diff"]
+
+
+@pytest.mark.asyncio
+async def test_request_typed_invalidate_schema_cache_forces_refetch(agent):
+    """``invalidate_schema_cache(agent_type, operation)`` clears the
+    cached schema for that one (agent, op) pair so the next typed
+    call refetches. Use case: the destination agent restarted with a
+    changed schema and the caller knows it."""
+    fake = _FakeBusHTTP({
+        "help": _help_schema_response(
+            "review_diff", {"diff": {"type": "string", "required": True}},
+        ),
+        "review_diff": {"result": {}},
+    })
+    agent._http = fake
+
+    await agent.request_typed(
+        agent_type="reviewer", operation="review_diff", args={"diff": "x"},
+    )
+    assert fake.operations_called == ["help", "review_diff"]
+
+    agent.invalidate_schema_cache("reviewer", "review_diff")
+    await agent.request_typed(
+        agent_type="reviewer", operation="review_diff", args={"diff": "y"},
+    )
+    # help called again after invalidation.
+    assert fake.operations_called == [
+        "help", "review_diff", "help", "review_diff",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_request_typed_invalidate_all_clears_every_entry(agent):
+    """``invalidate_schema_cache()`` with no args drops every cached
+    entry — useful when the bus restarts and every remote schema
+    might be stale."""
+    fake = _FakeBusHTTP({
+        "help": _help_schema_response(
+            "review_diff", {"diff": {"type": "string", "required": True}},
+        ),
+        "review_diff": {"result": {}},
+    })
+    agent._http = fake
+
+    await agent.request_typed(
+        agent_type="reviewer", operation="review_diff", args={"diff": "x"},
+    )
+    assert agent._remote_schema_cache  # populated
+    agent.invalidate_schema_cache()
+    assert agent._remote_schema_cache == {}
+
+
+@pytest.mark.asyncio
+async def test_request_typed_skips_validation_for_skill_without_schema(agent):
+    """If the destination's help() returns ``found: false`` (skill
+    unknown on target) or returns a non-dict schema value, fall
+    through to unvalidated dispatch — same posture as the schema
+    fetch failure path. The caller still gets a remote response;
+    the dispatcher's strict_args (if set) handles the protection on
+    the receiving side."""
+    fake = _FakeBusHTTP({
+        "help": {
+            "result": {
+                "aspect": "schema",
+                "skills": [
+                    {"name": "review_diff", "found": False,
+                     "reason": "no skill with that name on this agent"},
+                ],
+            },
+        },
+        "review_diff": {"result": {"ok": True}},
+    })
+    agent._http = fake
+    result = await agent.request_typed(
+        agent_type="reviewer", operation="review_diff", args={"anything": "goes"},
+    )
+    assert result == {"result": {"ok": True}}
+    assert fake.operations_called == ["help", "review_diff"]
+
+
+@pytest.mark.asyncio
+async def test_request_typed_caches_per_agent_type_no_cross_talk(agent):
+    """Same operation name on two different agent_types must cache
+    independently — ``reviewer.review_diff`` and ``developer.review_diff``
+    have DIFFERENT schemas in the real fleet, and a regression that
+    keys on operation alone (not the (agent_type, op) tuple) would
+    silently apply one agent's schema to the other."""
+
+    class _RouterFakeHTTP:
+        """Routes help() responses by ``agent_type`` so each remote
+        sees its own schema for the same operation name."""
+
+        def __init__(self):
+            self.calls: list[tuple[str, str]] = []
+            self.schemas = {
+                "reviewer": {"diff": {"type": "string", "required": True}},
+                "developer": {"diff": {"type": "object", "required": True}},
+            }
+
+        async def post(self, url, *, json=None, timeout=None):
+            payload = json or {}
+            agent_type = payload.get("agent_type", "")
+            op = payload.get("operation", "")
+            self.calls.append((agent_type, op))
+            if op == "help":
+                schema = self.schemas[agent_type]
+                resp = _help_schema_response("review_diff", schema)
+            else:
+                resp = {"result": {"agent": agent_type}}
+
+            class _Resp:
+                def json(self_inner):
+                    return resp
+
+            return _Resp()
+
+        async def aclose(self):
+            pass
+
+    fake = _RouterFakeHTTP()
+    agent._http = fake
+
+    # reviewer expects str → str arg passes
+    r1 = await agent.request_typed(
+        agent_type="reviewer",
+        operation="review_diff",
+        args={"diff": "patch"},
+    )
+    assert r1 == {"result": {"agent": "reviewer"}}
+
+    # developer expects object — same str arg should now FAIL because
+    # the developer schema demands ``object``. If the cache were keyed
+    # on operation alone, reviewer's str-schema would have been
+    # reused and this call would have wrongly passed.
+    r2 = await agent.request_typed(
+        agent_type="developer",
+        operation="review_diff",
+        args={"diff": "patch"},
+    )
+    assert "error" in r2
+    assert "object" in r2["error"]
+    # Only the developer-flavored object call should pass:
+    r3 = await agent.request_typed(
+        agent_type="developer",
+        operation="review_diff",
+        args={"diff": {"v": 1}},
+    )
+    assert r3 == {"result": {"agent": "developer"}}
+
+
+@pytest.mark.asyncio
+async def test_request_typed_surfaces_missing_required_field(agent):
+    """Required-field-missing surfaces locally as a clean error
+    envelope before any remote dispatch — same shape as the
+    dispatcher-side strict_args path."""
+    fake = _FakeBusHTTP({
+        "help": _help_schema_response(
+            "review_diff", {"diff": {"type": "string", "required": True}},
+        ),
+    })
+    agent._http = fake
+    result = await agent.request_typed(
+        agent_type="reviewer",
+        operation="review_diff",
+        args={},
+    )
+    assert "error" in result
+    assert "missing required" in result["error"]
+    assert "diff" in result["error"]
+    # No remote dispatch — local validation short-circuited.
+    assert fake.operations_called == ["help"]
+
+
+@pytest.mark.asyncio
+async def test_request_typed_invalidate_agent_type_only_clears_that_agent(agent):
+    """``invalidate_schema_cache(agent_type)`` with no operation
+    clears every cached entry for that agent but leaves other
+    agents' cached schemas intact. Use case: a single remote agent
+    restarted with new schemas; other agents are still in sync."""
+    fake = _FakeBusHTTP({
+        "help": _help_schema_response(
+            "review_diff", {"diff": {"type": "string", "required": True}},
+        ),
+        "review_diff": {"result": {}},
+    })
+    agent._http = fake
+
+    # Populate cache entries for two agent types.
+    await agent.request_typed(
+        agent_type="reviewer", operation="review_diff", args={"diff": "x"},
+    )
+    await agent.request_typed(
+        agent_type="developer", operation="review_diff", args={"diff": "y"},
+    )
+    assert ("reviewer", "review_diff") in agent._remote_schema_cache
+    assert ("developer", "review_diff") in agent._remote_schema_cache
+
+    # Invalidate only the reviewer entries.
+    agent.invalidate_schema_cache("reviewer")
+    assert ("reviewer", "review_diff") not in agent._remote_schema_cache
+    # Developer's entry survives.
+    assert ("developer", "review_diff") in agent._remote_schema_cache
+
+
+@pytest.mark.asyncio
+async def test_request_typed_handles_realistic_bus_envelope_with_extra_keys(agent):
+    """The bus envelope can carry extra keys (``trace_id``, timing,
+    routing metadata) alongside ``result``. The probe must extract
+    the schema from inside ``result`` regardless of what else the
+    envelope carries."""
+
+    class _RealisticHTTP:
+        def __init__(self):
+            self.calls: list[str] = []
+
+        async def post(self_inner, url, *, json=None, timeout=None):
+            op = (json or {}).get("operation", "")
+            self_inner.calls.append(op)
+            if op == "help":
+                resp = {
+                    "result": {
+                        "aspect": "schema",
+                        "skills": [{
+                            "name": "review_diff",
+                            "found": True,
+                            "value": {
+                                "diff": {"type": "string", "required": True},
+                            },
+                        }],
+                    },
+                    "trace_id": "t-abc123",
+                    "served_at": 1234567890.0,
+                    "agent_type": "reviewer",
+                    "served_by_pool": "gpu",
+                }
+            else:
+                resp = {
+                    "result": {"findings": []},
+                    "trace_id": "t-def456",
+                    "served_at": 1234567891.0,
+                }
+
+            class _R:
+                def json(self):
+                    return resp
+
+            return _R()
+
+        async def aclose(self):
+            pass
+
+    fake = _RealisticHTTP()
+    agent._http = fake
+
+    # Schema is correctly extracted from inside the realistic envelope;
+    # validation runs and passes the well-formed call through.
+    result = await agent.request_typed(
+        agent_type="reviewer",
+        operation="review_diff",
+        args={"diff": "patch content"},
+    )
+    assert result["result"] == {"findings": []}
+    assert result["trace_id"] == "t-def456"
+    assert fake.calls == ["help", "review_diff"]
+
+
+@pytest.mark.asyncio
+async def test_request_typed_validates_against_empty_schema(agent):
+    """An empty schema ``{}`` is a valid zero-args contract under
+    ``strict_args=True`` — caller-side validation must reject any
+    kwargs locally rather than treating ``{}`` as "no schema". This
+    pins the negative-cache sentinel as distinct from a real empty
+    schema (Copilot pass-1 finding on PR#23)."""
+    fake = _FakeBusHTTP({
+        "help": _help_schema_response("ping", {}),
+    })
+    agent._http = fake
+    result = await agent.request_typed(
+        agent_type="reviewer", operation="ping", args={"unexpected": "kw"},
+    )
+    # Local rejection — empty-schema marker, no remote dispatch.
+    assert "error" in result
+    assert "empty schema" in result["error"]
+    assert fake.operations_called == ["help"]
+
+
+@pytest.mark.asyncio
+async def test_request_typed_empty_schema_passes_zero_args_through(agent):
+    """The empty-schema contract still allows the no-arg call: when
+    args is ``None`` (or ``{}``), validation passes and the request
+    is dispatched. This is the other side of the empty-schema
+    contract — empty in, empty out."""
+    fake = _FakeBusHTTP({
+        "help": _help_schema_response("ping", {}),
+        "ping": {"result": {"pong": True}},
+    })
+    agent._http = fake
+    result = await agent.request_typed(
+        agent_type="reviewer", operation="ping", args=None,
+    )
+    assert result == {"result": {"pong": True}}
+    assert fake.operations_called == ["help", "ping"]
+
+
+@pytest.mark.asyncio
+async def test_request_typed_negative_cache_sentinel_distinct_from_empty_schema(agent):
+    """The "fetch failed" sentinel must not be ``{}`` — otherwise a
+    legitimately empty schema would mask validation. After a failed
+    fetch and a subsequent successful one (post-invalidation) for an
+    empty-schema skill, kwargs should be rejected locally — proving
+    the cache state was the failure sentinel, not an empty schema."""
+    call_count = {"help": 0}
+
+    class _FlipFlopHTTP:
+        def __init__(self):
+            self.calls: list[str] = []
+
+        async def post(self_inner, url, *, json=None, timeout=None):
+            op = (json or {}).get("operation", "")
+            self_inner.calls.append(op)
+            if op == "help":
+                call_count["help"] += 1
+                if call_count["help"] == 1:
+                    raise RuntimeError("transient")
+                resp = _help_schema_response("ping", {})
+            else:
+                resp = {"result": {"pong": True}}
+
+            class _R:
+                def json(self):
+                    return resp
+
+            return _R()
+
+        async def aclose(self):
+            pass
+
+    fake = _FlipFlopHTTP()
+    agent._http = fake
+
+    # First call: fetch fails, sentinel cached, dispatch falls through.
+    r1 = await agent.request_typed(
+        agent_type="reviewer", operation="ping", args={"k": "v"},
+    )
+    assert r1 == {"result": {"pong": True}}
+
+    # Invalidate so the next call refetches; empty schema returns this time.
+    agent.invalidate_schema_cache("reviewer", "ping")
+
+    # Second call: schema = {}, kwargs must be rejected locally.
+    r2 = await agent.request_typed(
+        agent_type="reviewer", operation="ping", args={"k": "v"},
+    )
+    assert "error" in r2
+    assert "empty schema" in r2["error"]
+
+
+@pytest.mark.asyncio
+async def test_request_typed_stampede_real_schema_overwrites_failure_sentinel(agent):
+    """Concurrent stampede recovery: when one sibling coroutine
+    writes the failure sentinel before another's successful fetch
+    lands, the successful fetch must overwrite the sentinel rather
+    than silently losing the schema. Otherwise a transient sibling
+    failure would poison the cache for an in-flight success until
+    manual ``invalidate_schema_cache`` (Copilot pass-2 finding)."""
+    # Pre-populate the cache with the failure sentinel by hand,
+    # then call request_typed — the path should run a fresh fetch
+    # because the key check uses ``cache_key not in cache``... but
+    # the key IS in cache (with the sentinel). So this test
+    # exercises the in-method overwrite branch by simulating two
+    # interleaved fetches: we manually set the sentinel after the
+    # first fetch starts but before its write lands.
+    from khonliang_bus.agent import _SCHEMA_FETCH_FAILED
+
+    schema = {"diff": {"type": "string", "required": True}}
+    real_schema_response = _help_schema_response("review_diff", schema)
+
+    # Wire up a fake HTTP that returns the real schema, but right
+    # before request_typed writes the cache, a "sibling" injects
+    # the failure sentinel into the cache slot. The fix should
+    # detect the sentinel and overwrite it with the real schema.
+    sibling_injected = False
+
+    class _RaceyHTTP:
+        def __init__(self):
+            self.calls: list[str] = []
+
+        async def post(self_inner, url, *, json=None, timeout=None):
+            nonlocal sibling_injected
+            op = (json or {}).get("operation", "")
+            self_inner.calls.append(op)
+            if op == "help" and not sibling_injected:
+                # Inject the sibling's failure sentinel into the
+                # cache before we return — simulates a concurrent
+                # coroutine that lost the race to the failure side.
+                # ``request_typed`` has already populated
+                # ``_remote_schema_cache`` (line 1495-1496), so we
+                # mutate it in place — assignment via
+                # ``= getattr(...) or {}`` would silently swap the
+                # dict because ``{}`` is falsy, breaking the
+                # caller's local-variable identity.
+                agent._remote_schema_cache[("reviewer", "review_diff")] = (
+                    _SCHEMA_FETCH_FAILED
+                )
+                sibling_injected = True
+                resp = real_schema_response
+            else:
+                resp = {"result": {"ok": True}}
+
+            class _R:
+                def json(self):
+                    return resp
+
+            return _R()
+
+        async def aclose(self):
+            pass
+
+    fake = _RaceyHTTP()
+    agent._http = fake
+
+    # First call: our fetch succeeds, the "sibling" wrote the
+    # sentinel mid-fetch. Our fix must overwrite it.
+    result = await agent.request_typed(
+        agent_type="reviewer",
+        operation="review_diff",
+        args={"diff": "hello"},
+    )
+    # Successful real-schema overwrite — call dispatched, no error.
+    assert result == {"result": {"ok": True}}
+    # Cache now holds the real schema, not the sentinel.
+    cached = agent._remote_schema_cache[("reviewer", "review_diff")]
+    assert cached == schema
+    assert cached is not _SCHEMA_FETCH_FAILED
+
+
+@pytest.mark.asyncio
+async def test_request_typed_real_schema_not_overwritten_by_sentinel(agent):
+    """Inverse of the stampede recovery test: when the cache already
+    holds a real schema, a subsequent failed fetch must NOT
+    overwrite it with the sentinel. This pins the asymmetric
+    overwrite policy — sentinel→real upgrades, real→sentinel
+    downgrades are blocked."""
+    from khonliang_bus.agent import _SCHEMA_FETCH_FAILED
+
+    schema = {"diff": {"type": "string", "required": True}}
+    # Hand-prime the cache with a real schema, then simulate the
+    # mid-fetch overwrite path: another fetch failing while the
+    # cache already holds a successful schema.
+    agent._remote_schema_cache = {("reviewer", "review_diff"): schema}
+
+    # request_typed will see the key already in cache (real schema)
+    # and skip the fetch entirely — that's the correct fast path.
+    # To exercise the "real schema present + new failure" branch
+    # explicitly, we drive the in-method overwrite logic by hand
+    # via a second concurrent simulation: clear the entry, then
+    # have the help fetch fail while a sibling has already written
+    # a real schema before our write lands.
+    sibling_wrote_real = False
+
+    class _SiblingWritesRealHTTP:
+        async def post(self_inner, url, *, json=None, timeout=None):
+            nonlocal sibling_wrote_real
+            op = (json or {}).get("operation", "")
+            if op == "help" and not sibling_wrote_real:
+                # Sibling injects a real schema before our failure lands.
+                agent._remote_schema_cache[("reviewer", "review_diff")] = (
+                    schema
+                )
+                sibling_wrote_real = True
+                raise RuntimeError("our fetch fails")
+
+            class _R:
+                def json(self):
+                    return {"result": {"ok": True}}
+
+            return _R()
+
+        async def aclose(self):
+            pass
+
+    # Clear cache so request_typed will fetch.
+    agent._remote_schema_cache.clear()
+    agent._http = _SiblingWritesRealHTTP()
+
+    # Our fetch fails (raises) → returns None → caller would write
+    # sentinel. But sibling wrote a real schema mid-flight. The
+    # asymmetric-overwrite logic must keep the real schema.
+    result = await agent.request_typed(
+        agent_type="reviewer",
+        operation="review_diff",
+        args={"diff": "x"},
+    )
+    # Real schema validated locally → call dispatched cleanly.
+    assert result == {"result": {"ok": True}}
+    cached = agent._remote_schema_cache[("reviewer", "review_diff")]
+    assert cached == schema
+    assert cached is not _SCHEMA_FETCH_FAILED
+
+
+@pytest.mark.asyncio
+async def test_fetch_remote_schema_warns_on_skill_not_found(agent, caplog):
+    """``_fetch_remote_skill_schema`` returning None silently for
+    ``found:false`` was a docstring/behavior drift (Copilot pass-2
+    finding). Now logs a single warning with the reason so operators
+    notice when typed-call validation is silently disabled. Spam is
+    bounded by the negative-cache: one warning per (agent_type, op)
+    until ``invalidate_schema_cache``."""
+    import logging
+
+    fake = _FakeBusHTTP({
+        "help": {
+            "result": {
+                "aspect": "schema",
+                "skills": [{
+                    "name": "review_diff", "found": False,
+                    "reason": "no skill with that name on this agent",
+                }],
+            },
+        },
+        "review_diff": {"result": {"ok": True}},
+    })
+    agent._http = fake
+
+    with caplog.at_level(logging.WARNING):
+        await agent.request_typed(
+            agent_type="reviewer", operation="review_diff",
+            args={"x": 1},
+        )
+
+    msgs = [r.message for r in caplog.records if "skill not found" in r.message]
+    assert msgs, "expected warning about skill not found"
+    assert "reviewer" in msgs[0]
+    assert "review_diff" in msgs[0]
+
+
+@pytest.mark.asyncio
+async def test_fetch_remote_schema_warns_on_non_dict_envelope(agent, caplog):
+    """Non-dict bus envelope (a list / scalar / None) is a transport
+    or upstream-bug signal. Log a warning rather than silently
+    dropping validation."""
+    import logging
+
+    class _NonDictHTTP:
+        async def post(self_inner, url, *, json=None, timeout=None):
+            op = (json or {}).get("operation", "")
+
+            class _R:
+                def json(self):
+                    if op == "help":
+                        return ["unexpected", "list", "shape"]
+                    return {"result": {"ok": True}}
+
+            return _R()
+
+        async def aclose(self):
+            pass
+
+    agent._http = _NonDictHTTP()
+
+    with caplog.at_level(logging.WARNING):
+        await agent.request_typed(
+            agent_type="reviewer", operation="review_diff", args={"x": 1},
+        )
+
+    msgs = [r.message for r in caplog.records if "non-dict envelope" in r.message]
+    assert msgs, "expected warning about non-dict envelope"
+    assert "list" in msgs[0]
+
+
+@pytest.mark.asyncio
+async def test_request_typed_rejects_non_dict_args_with_envelope_error(agent):
+    """Non-dict ``args`` (a list, a string, an int) is a caller bug.
+    Reject it locally with the same error envelope the dispatcher
+    emits — no schema fetch, no remote round-trip, no shape-mismatch
+    crash inside the validator (Copilot pass-3 finding)."""
+    fake = _FakeBusHTTP({})
+    agent._http = fake
+
+    for bad_args, expected_type in [
+        (["not", "a", "dict"], "list"),
+        ("string", "str"),
+        (42, "int"),
+        ((1, 2), "tuple"),
+    ]:
+        result = await agent.request_typed(
+            agent_type="reviewer", operation="review_diff", args=bad_args,
+        )
+        assert "error" in result
+        assert "must be an object" in result["error"]
+        assert expected_type in result["error"]
+    # No schema fetch, no remote dispatch — pure local rejection.
+    assert fake.operations_called == []
+
+
+@pytest.mark.asyncio
+async def test_request_typed_normalizes_none_args_to_empty_dict(agent):
+    """``args=None`` is the no-args contract; it must round-trip the
+    same way ``args={}`` does — schema fetched, validated, dispatched
+    with ``{}`` to the remote so the receiver sees a consistent
+    shape regardless of which form the caller used."""
+    fake = _FakeBusHTTP({
+        "help": _help_schema_response("ping", {}),
+        "ping": {"result": {"pong": True}},
+    })
+    agent._http = fake
+    result = await agent.request_typed(
+        agent_type="reviewer", operation="ping", args=None,
+    )
+    assert result == {"result": {"pong": True}}
+    # Outgoing dispatch carried args={} (normalized from None).
+    ping_call = next(
+        c for c in fake.calls if c["json"]["operation"] == "ping"
+    )
+    assert ping_call["json"]["args"] == {}

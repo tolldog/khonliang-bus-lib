@@ -374,6 +374,16 @@ class WelcomeEntryPoint:
 _EMPTY_DELEGATES: Mapping[str, str] = MappingProxyType({})
 
 
+# Sentinel for ``request_typed``'s remote-schema cache. A fetch
+# failure stores this object so the cache hit short-circuits
+# without retrying, while staying distinguishable from a
+# legitimately empty schema ``{}`` (a zero-args contract under
+# ``strict_args=True``). Using ``object()`` rather than ``None``
+# or ``{}`` keeps "fetch failed" non-aliasable with any valid
+# schema value a remote agent might declare.
+_SCHEMA_FETCH_FAILED: Any = object()
+
+
 @dataclass(frozen=True)
 class Welcome:
     """Editorial agent introduction for the cold-start ``welcome`` skill.
@@ -1450,6 +1460,249 @@ class BaseAgent:
             timeout=http_timeout,
         )
         return r.json()
+
+    async def request_typed(
+        self,
+        agent_type: str,
+        operation: str,
+        args: dict[str, Any] | None = None,
+        timeout: float = 30.0,
+        response_mode: str = "raw",
+    ) -> dict:
+        """Caller-side schema validation companion to ``request``
+        (fr_khonliang-bus-lib_6e42567d Mode B caller side).
+
+        Looks up the destination skill's input_schema (via the
+        target's built-in ``help`` skill, lazy-cached per
+        ``(agent_type, operation)``), validates ``args`` locally
+        with the same logic the dispatcher uses, then dispatches
+        only when the call shape is correct. Surfaces silent-drop
+        bugs BEFORE the network round-trip — the caller sees the
+        same error envelope a strict_args=True receiver would
+        emit, but without paying the bus + remote hop.
+
+        On schema-fetch failure (target down, help-skill missing,
+        unknown skill) the call falls through to the existing
+        ``request`` path with a one-time warning so the caller
+        isn't blocked on validation infrastructure that's
+        independently broken. Cache cleared via
+        ``invalidate_schema_cache`` when a remote agent restarts
+        with a changed schema.
+        """
+        # Normalize args once at the entry point — None becomes the
+        # empty dict (the no-args contract), non-dict short-circuits
+        # with the same error envelope ``_dispatch_request`` emits.
+        # Without this normalization a list (or other unhashable /
+        # non-mapping shape) would either crash the local validator
+        # (``set(list_with_unhashables)``), validate against the
+        # wrong shape (set-membership against schema field names),
+        # or be silently coerced by ``request`` to ``{}`` — three
+        # different ways to mask the caller bug. Use the normalized
+        # dict for both validation AND the outgoing dispatch so the
+        # local and remote paths agree on the call shape.
+        if args is None:
+            normalized_args: dict[str, Any] = {}
+        elif isinstance(args, dict):
+            normalized_args = args
+        else:
+            return {
+                "error": (
+                    f"args must be an object (got {type(args).__name__})"
+                )
+            }
+
+        cache_key = (agent_type, operation)
+        cache = getattr(self, "_remote_schema_cache", None)
+        if cache is None:
+            cache = {}
+            self._remote_schema_cache = cache
+
+        if cache_key not in cache:
+            fetched = await self._fetch_remote_skill_schema(
+                agent_type, operation, timeout=timeout
+            )
+            new_value = (
+                fetched if fetched is not None else _SCHEMA_FETCH_FAILED
+            )
+            # Stampede guard: two coroutines on the same uncached key
+            # can both miss and both fetch. The first to return wins
+            # the slot, EXCEPT when the existing entry is the
+            # failure sentinel and we have a real schema — in that
+            # case overwrite, so a transient sibling failure can't
+            # poison the cache for a successful fetch in flight.
+            # Conversely, never overwrite a real schema with the
+            # sentinel. ``None`` from the fetch means "couldn't
+            # fetch" — cached as ``_SCHEMA_FETCH_FAILED`` so
+            # subsequent calls short-circuit without retrying
+            # (avoiding retry storms) while staying distinguishable
+            # from a legitimately empty schema ``{}`` (a valid
+            # zero-args contract under ``strict_args=True``).
+            if cache_key not in cache:
+                cache[cache_key] = new_value
+            elif (
+                cache[cache_key] is _SCHEMA_FETCH_FAILED
+                and new_value is not _SCHEMA_FETCH_FAILED
+            ):
+                cache[cache_key] = new_value
+        schema = cache[cache_key]
+
+        # Validate whenever the schema was successfully fetched —
+        # even ``{}`` (zero-args contract). Only the explicit
+        # fetch-failure sentinel skips validation.
+        if schema is not _SCHEMA_FETCH_FAILED:
+            # Synthesize a minimal Skill so the existing validator
+            # can be reused verbatim — same error shape as the
+            # dispatcher-side path, same field-name semantics.
+            # A malformed remote schema (unexpected shapes, types
+            # the Skill dataclass rejects) shouldn't block the
+            # caller — fall through to unvalidated dispatch the
+            # same way a schema fetch failure does, with a
+            # warning so the operator notices.
+            try:
+                stand_in = Skill(
+                    name=operation, parameters=schema, strict_args=True,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "request_typed: remote schema for %s.%s rejected by "
+                    "Skill construction (%s) — falling back to "
+                    "unvalidated dispatch.",
+                    agent_type, operation, exc,
+                )
+            else:
+                error = self._validate_args_against_schema(
+                    stand_in, normalized_args,
+                )
+                if error is not None:
+                    return {"error": error}
+
+        return await self.request(
+            agent_type=agent_type,
+            operation=operation,
+            args=normalized_args,
+            timeout=timeout,
+            response_mode=response_mode,
+        )
+
+    async def _fetch_remote_skill_schema(
+        self,
+        agent_type: str,
+        operation: str,
+        timeout: float = 30.0,
+    ) -> dict[str, Any] | None:
+        """Fetch the destination's declared schema for one operation.
+
+        Uses the built-in ``help(skill_names=[op], aspect='schema')``
+        round-trip — every fleet agent inherits help from bus-lib
+        (fr_khonliang-bus-lib_42555320), so this works without
+        per-agent cooperation. Returns the schema dict on success
+        (including ``{}`` when the skill genuinely takes no args)
+        or ``None`` on any of: help skill unavailable, operation
+        unknown on target, transport error. The caller maps
+        ``None`` to the ``_SCHEMA_FETCH_FAILED`` sentinel in the
+        cache to short-circuit retries while staying distinct
+        from a real empty schema.
+        """
+        try:
+            response = await self.request(
+                agent_type=agent_type,
+                operation="help",
+                args={"skill_names": [operation], "aspect": "schema"},
+                timeout=timeout,
+            )
+        except Exception as exc:
+            logger.warning(
+                "request_typed: schema fetch failed for %s.%s: %s — "
+                "falling back to unvalidated dispatch.",
+                agent_type, operation, exc,
+            )
+            return None
+
+        # ``self.request`` returns ``r.json()`` — could be a dict (the
+        # normal envelope), a list, a scalar, or None for malformed /
+        # unexpected responses. Reject anything that isn't a dict
+        # before probing, so a downstream ``.get`` doesn't raise
+        # AttributeError out of the schema-fetch path. Warn on each
+        # non-dispatch outcome so the docstring's "fall through with
+        # a warning" promise holds for every return-None path, not
+        # just transport-exception. Spam is bounded by the caller's
+        # negative-cache: at most one warning per (agent_type, op).
+        if not isinstance(response, dict):
+            logger.warning(
+                "request_typed: schema fetch for %s.%s returned non-dict "
+                "envelope (%s) — falling back to unvalidated dispatch.",
+                agent_type, operation, type(response).__name__,
+            )
+            return None
+
+        # The bus envelope wraps the actual response; the help skill's
+        # aspect-mode payload nests under ``result`` (the standard
+        # MCP shape) or appears at the top level depending on the
+        # bus's response transform. Probe both.
+        body = response.get("result", response)
+        if not isinstance(body, dict):
+            logger.warning(
+                "request_typed: schema fetch for %s.%s returned non-dict "
+                "result body — falling back to unvalidated dispatch.",
+                agent_type, operation,
+            )
+            return None
+        skills = body.get("skills")
+        if not isinstance(skills, list) or not skills:
+            logger.warning(
+                "request_typed: schema fetch for %s.%s missing 'skills' "
+                "list (target may not implement help skill) — falling "
+                "back to unvalidated dispatch.",
+                agent_type, operation,
+            )
+            return None
+        entry = skills[0]
+        if not isinstance(entry, dict) or not entry.get("found"):
+            reason = (
+                entry.get("reason", "unknown skill")
+                if isinstance(entry, dict)
+                else "malformed help entry"
+            )
+            logger.warning(
+                "request_typed: schema fetch for %s.%s reports skill not "
+                "found (%s) — falling back to unvalidated dispatch.",
+                agent_type, operation, reason,
+            )
+            return None
+        value = entry.get("value")
+        if not isinstance(value, dict):
+            logger.warning(
+                "request_typed: schema fetch for %s.%s returned non-dict "
+                "schema value — falling back to unvalidated dispatch.",
+                agent_type, operation,
+            )
+            return None
+        return value
+
+    def invalidate_schema_cache(
+        self,
+        agent_type: str | None = None,
+        operation: str | None = None,
+    ) -> None:
+        """Drop one or all entries from the typed-request schema cache.
+
+        Call after a remote agent restarts with a changed schema, or
+        when the cache is suspected stale. ``agent_type=None`` clears
+        every entry; passing ``agent_type`` alone clears all skills
+        on that agent; passing both clears the single entry.
+        """
+        cache = getattr(self, "_remote_schema_cache", None)
+        if cache is None:
+            return
+        if agent_type is None:
+            cache.clear()
+            return
+        if operation is None:
+            keys = [k for k in cache if k[0] == agent_type]
+        else:
+            keys = [(agent_type, operation)]
+        for key in keys:
+            cache.pop(key, None)
 
     # -- gap reporting --
 

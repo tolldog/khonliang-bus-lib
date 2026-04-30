@@ -1489,6 +1489,28 @@ class BaseAgent:
         ``invalidate_schema_cache`` when a remote agent restarts
         with a changed schema.
         """
+        # Normalize args once at the entry point — None becomes the
+        # empty dict (the no-args contract), non-dict short-circuits
+        # with the same error envelope ``_dispatch_request`` emits.
+        # Without this normalization a list (or other unhashable /
+        # non-mapping shape) would either crash the local validator
+        # (``set(list_with_unhashables)``), validate against the
+        # wrong shape (set-membership against schema field names),
+        # or be silently coerced by ``request`` to ``{}`` — three
+        # different ways to mask the caller bug. Use the normalized
+        # dict for both validation AND the outgoing dispatch so the
+        # local and remote paths agree on the call shape.
+        if args is None:
+            normalized_args: dict[str, Any] = {}
+        elif isinstance(args, dict):
+            normalized_args = args
+        else:
+            return {
+                "error": (
+                    f"args must be an object (got {type(args).__name__})"
+                )
+            }
+
         cache_key = (agent_type, operation)
         cache = getattr(self, "_remote_schema_cache", None)
         if cache is None:
@@ -1548,14 +1570,16 @@ class BaseAgent:
                     agent_type, operation, exc,
                 )
             else:
-                error = self._validate_args_against_schema(stand_in, args or {})
+                error = self._validate_args_against_schema(
+                    stand_in, normalized_args,
+                )
                 if error is not None:
                     return {"error": error}
 
         return await self.request(
             agent_type=agent_type,
             operation=operation,
-            args=args,
+            args=normalized_args,
             timeout=timeout,
             response_mode=response_mode,
         )

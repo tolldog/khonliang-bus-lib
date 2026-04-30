@@ -2660,3 +2660,50 @@ async def test_fetch_remote_schema_warns_on_non_dict_envelope(agent, caplog):
     msgs = [r.message for r in caplog.records if "non-dict envelope" in r.message]
     assert msgs, "expected warning about non-dict envelope"
     assert "list" in msgs[0]
+
+
+@pytest.mark.asyncio
+async def test_request_typed_rejects_non_dict_args_with_envelope_error(agent):
+    """Non-dict ``args`` (a list, a string, an int) is a caller bug.
+    Reject it locally with the same error envelope the dispatcher
+    emits — no schema fetch, no remote round-trip, no shape-mismatch
+    crash inside the validator (Copilot pass-3 finding)."""
+    fake = _FakeBusHTTP({})
+    agent._http = fake
+
+    for bad_args, expected_type in [
+        (["not", "a", "dict"], "list"),
+        ("string", "str"),
+        (42, "int"),
+        ((1, 2), "tuple"),
+    ]:
+        result = await agent.request_typed(
+            agent_type="reviewer", operation="review_diff", args=bad_args,
+        )
+        assert "error" in result
+        assert "must be an object" in result["error"]
+        assert expected_type in result["error"]
+    # No schema fetch, no remote dispatch — pure local rejection.
+    assert fake.operations_called == []
+
+
+@pytest.mark.asyncio
+async def test_request_typed_normalizes_none_args_to_empty_dict(agent):
+    """``args=None`` is the no-args contract; it must round-trip the
+    same way ``args={}`` does — schema fetched, validated, dispatched
+    with ``{}`` to the remote so the receiver sees a consistent
+    shape regardless of which form the caller used."""
+    fake = _FakeBusHTTP({
+        "help": _help_schema_response("ping", {}),
+        "ping": {"result": {"pong": True}},
+    })
+    agent._http = fake
+    result = await agent.request_typed(
+        agent_type="reviewer", operation="ping", args=None,
+    )
+    assert result == {"result": {"pong": True}}
+    # Outgoing dispatch carried args={} (normalized from None).
+    ping_call = next(
+        c for c in fake.calls if c["json"]["operation"] == "ping"
+    )
+    assert ping_call["json"]["args"] == {}

@@ -86,8 +86,18 @@ class BusConnector:
         pid: int,
         skills: list[dict],
         collaborations: list[dict] | None = None,
+        launch_spec: dict | None = None,
+        launch_info: dict | None = None,
     ) -> None:
         """Connect to the bus and register.
+
+        ``launch_spec`` declares how to re-spawn an agent of this id
+        (executable, argv, cwd, config). ``launch_info`` describes the
+        process currently serving this id (pid, started_at, git info).
+        Older buses ignore unknown fields; older agents that don't pass
+        these keep the prior register-payload shape working. See
+        :mod:`khonliang_bus.launch` and ``fr_khonliang-bus-lib_2cfc0de6``
+        / ``fr_khonliang-bus-lib_cccaa6a9``.
 
         Raises RuntimeError if the bus is unreachable or registration fails.
         """
@@ -100,6 +110,10 @@ class BusConnector:
             "skills": skills,
             "collaborations": collaborations or [],
         }
+        if launch_spec is not None:
+            self._registration_payload["launch_spec"] = launch_spec
+        if launch_info is not None:
+            self._registration_payload["launch_info"] = launch_info
 
         ws_url = self._ws_url("/v1/agent")
         try:

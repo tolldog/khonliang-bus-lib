@@ -60,6 +60,86 @@ async def test_connect_error_includes_bus_url():
         await c.connect_and_register("test", "0.1.0", 1, [])
 
 
+@pytest.mark.asyncio
+async def test_connect_and_register_omits_launch_fields_when_not_provided():
+    """Backward compat: callers that don't pass launch_spec/launch_info keep the
+    prior register-payload shape — older buses won't see unexpected keys.
+
+    fr_khonliang-bus-lib_2cfc0de6 / fr_khonliang-bus-lib_cccaa6a9 — the
+    contract extension is additive.
+    """
+    c = BusConnector("http://localhost:1", "test-agent")
+    with pytest.raises(RuntimeError):  # bus unreachable; payload still built
+        await c.connect_and_register(
+            agent_type="test", version="0.1.0", pid=1234, skills=[],
+        )
+    payload = c._registration_payload
+    assert "launch_spec" not in payload
+    assert "launch_info" not in payload
+    # Existing fields stay intact.
+    assert payload["type"] == "register"
+    assert payload["id"] == "test-agent"
+    assert payload["pid"] == 1234
+
+
+@pytest.mark.asyncio
+async def test_connect_and_register_includes_launch_spec_when_provided():
+    c = BusConnector("http://localhost:1", "test-agent")
+    spec = {
+        "executable": "/opt/x/.venv/bin/python",
+        "argv": ["-m", "x.agent", "--config", "/etc/x/config.yaml"],
+        "cwd": "/opt/x",
+        "config": "/etc/x/config.yaml",
+    }
+    with pytest.raises(RuntimeError):
+        await c.connect_and_register(
+            agent_type="test",
+            version="0.1.0",
+            pid=1234,
+            skills=[],
+            launch_spec=spec,
+        )
+    assert c._registration_payload["launch_spec"] == spec
+    assert "launch_info" not in c._registration_payload
+
+
+@pytest.mark.asyncio
+async def test_connect_and_register_includes_launch_info_when_provided():
+    c = BusConnector("http://localhost:1", "test-agent")
+    info = {
+        "pid": 4242,
+        "started_at": 1234567.0,
+        "commit_sha": "deadbeef" * 5,
+        "branch": "main",
+        "dirty": False,
+    }
+    with pytest.raises(RuntimeError):
+        await c.connect_and_register(
+            agent_type="test",
+            version="0.1.0",
+            pid=1234,
+            skills=[],
+            launch_info=info,
+        )
+    assert c._registration_payload["launch_info"] == info
+    assert "launch_spec" not in c._registration_payload
+
+
+@pytest.mark.asyncio
+async def test_connect_and_register_includes_both_launch_fields():
+    """The common case: agent sends both at registration."""
+    c = BusConnector("http://localhost:1", "test-agent")
+    spec = {"executable": "/x", "argv": ["x"], "cwd": "/", "config": None}
+    info = {"pid": 1, "started_at": 0.0, "commit_sha": None, "branch": None, "dirty": None}
+    with pytest.raises(RuntimeError):
+        await c.connect_and_register(
+            agent_type="test", version="0.1.0", pid=1, skills=[],
+            launch_spec=spec, launch_info=info,
+        )
+    assert c._registration_payload["launch_spec"] == spec
+    assert c._registration_payload["launch_info"] == info
+
+
 def test_is_open_v14_state():
     """_is_open uses .state for websockets v14+ (no .open attribute)."""
     from unittest.mock import MagicMock

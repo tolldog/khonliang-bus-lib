@@ -1102,6 +1102,19 @@ class BaseAgent:
             on_request=self._dispatch_request,
         )
 
+        # Capture launch metadata at startup. ``launch_spec`` carries the
+        # declarative how-to-launch fields (executable, argv, cwd, config) —
+        # what the bus needs to spawn another process matching this agent_id.
+        # ``launch_info`` carries the runtime snapshot (pid, started_at, git
+        # info) — what process is currently serving this agent_id. Bus joins
+        # them to surface canonical-vs-ad-hoc provenance.
+        # See fr_khonliang-bus-lib_2cfc0de6 (launch_spec) +
+        # fr_khonliang-bus-lib_cccaa6a9 (launch_info).
+        from khonliang_bus.launch import capture_launch_spec, capture_launch_info
+
+        launch_spec = capture_launch_spec()
+        launch_info = capture_launch_info()
+
         # Connect and register (raises RuntimeError if bus is unreachable).
         # Wrap in try/finally so _http is cleaned up on failure.
         try:
@@ -1119,6 +1132,8 @@ class BaseAgent:
                     }
                     for c in collabs
                 ],
+                launch_spec=launch_spec,
+                launch_info=launch_info,
             )
 
         except Exception:

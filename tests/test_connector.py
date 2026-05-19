@@ -151,6 +151,67 @@ async def test_connect_and_register_includes_both_launch_fields():
     assert c._registration_payload["pid"] == 1
 
 
+@pytest.mark.asyncio
+async def test_connect_and_register_omits_welcome_when_not_provided():
+    """fr_khonliang-bus_f96722dd: welcome is additive. Calls that don't
+    pass it keep the prior payload shape so older buses see no
+    unexpected keys.
+    """
+    c = BusConnector("http://localhost:1", "test-agent")
+    with pytest.raises(RuntimeError):
+        await c.connect_and_register(
+            agent_type="test", version="0.1.0", pid=1, skills=[],
+        )
+    assert "welcome" not in c._registration_payload
+
+
+@pytest.mark.asyncio
+async def test_connect_and_register_includes_welcome_when_provided():
+    """Welcome dict is forwarded verbatim — the connector is a passthrough.
+
+    The shape is whatever ``handle_welcome`` returns; the bus is
+    responsible for persistence + serving. This test only verifies the
+    wire layer (fr_khonliang-bus_f96722dd contract extension on
+    bus-lib).
+    """
+    c = BusConnector("http://localhost:1", "test-agent")
+    welcome = {
+        "agent_id": "test-agent",
+        "agent_type": "test",
+        "version": "0.1.0",
+        "skill_count": 3,
+        "role": "test fixture",
+        "mission": "exercise the welcome path",
+    }
+    with pytest.raises(RuntimeError):
+        await c.connect_and_register(
+            agent_type="test", version="0.1.0", pid=1, skills=[],
+            welcome=welcome,
+        )
+    assert c._registration_payload["welcome"] == welcome
+
+
+@pytest.mark.asyncio
+async def test_connect_and_register_carries_all_three_extension_fields():
+    """The forward-shape: launch_spec + launch_info + welcome all
+    coexist in one register handshake. All three are independent
+    additive extensions; they don't interact.
+    """
+    c = BusConnector("http://localhost:1", "test-agent")
+    spec = {"executable": "/x", "args": ["-m", "x"], "cwd": "/", "config": None}
+    info = {"started_at": 0.0, "commit_sha": None, "branch": None, "dirty": None}
+    welcome = {"agent_id": "test-agent", "role": "r"}
+    with pytest.raises(RuntimeError):
+        await c.connect_and_register(
+            agent_type="test", version="0.1.0", pid=1, skills=[],
+            launch_spec=spec, launch_info=info, welcome=welcome,
+        )
+    payload = c._registration_payload
+    assert payload["launch_spec"] == spec
+    assert payload["launch_info"] == info
+    assert payload["welcome"] == welcome
+
+
 def test_is_open_v14_state():
     """_is_open uses .state for websockets v14+ (no .open attribute)."""
     from unittest.mock import MagicMock

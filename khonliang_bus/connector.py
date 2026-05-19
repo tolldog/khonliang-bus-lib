@@ -88,6 +88,7 @@ class BusConnector:
         collaborations: list[dict] | None = None,
         launch_spec: dict | None = None,
         launch_info: dict | None = None,
+        welcome: dict | None = None,
     ) -> None:
         """Connect to the bus and register.
 
@@ -97,7 +98,12 @@ class BusConnector:
         consumer respawns via ``[executable] + args``). ``launch_info``
         describes the process currently serving this id (``started_at``
         as wall-clock epoch + best-effort git fields; ``pid`` lives at
-        the top of this payload, not in ``launch_info``).
+        the top of this payload, not in ``launch_info``). ``welcome``
+        is the same dict shape ``handle_welcome`` returns — bus persists
+        it in a survives-deregister catalog so cold-start LLMs can
+        consult it via ``GET /v1/agents/<id>/welcome`` (or the
+        ``bus_welcome`` super-skill) even after the agent process
+        exits. See ``fr_khonliang-bus_f96722dd``.
         Older buses ignore unknown fields; older agents that don't pass
         these keep the prior register-payload shape working. See
         :mod:`khonliang_bus.launch` and ``fr_khonliang-bus-lib_2cfc0de6``
@@ -118,6 +124,8 @@ class BusConnector:
             self._registration_payload["launch_spec"] = launch_spec
         if launch_info is not None:
             self._registration_payload["launch_info"] = launch_info
+        if welcome is not None:
+            self._registration_payload["welcome"] = welcome
 
         ws_url = self._ws_url("/v1/agent")
         try:

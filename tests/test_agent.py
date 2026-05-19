@@ -176,6 +176,69 @@ async def test_start_fails_when_bus_unreachable():
         await a.start()
 
 
+# -- start() captures welcome and routes it to connect_and_register --
+#    fr_khonliang-bus_f96722dd: bus-lib computes the agent's welcome at
+#    startup so the bus can persist it alongside the register handshake,
+#    without per-agent boilerplate.
+
+@pytest.mark.asyncio
+async def test_start_passes_welcome_to_connector(monkeypatch):
+    """BaseAgent.start() computes its own welcome (via handle_welcome) and
+    forwards it to BusConnector.connect_and_register. Verified by capturing
+    the kwargs the connector receives — no real WebSocket is opened.
+    """
+    captured: dict = {}
+
+    async def fake_connect_and_register(self, **kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("intercepted; not opening WS")
+
+    from khonliang_bus.connector import BusConnector
+
+    monkeypatch.setattr(BusConnector, "connect_and_register", fake_connect_and_register)
+
+    a = EchoAgent(agent_id="welcome-test", bus_url="http://localhost:1")
+    with pytest.raises(RuntimeError, match="intercepted"):
+        await a.start()
+
+    welcome = captured.get("welcome")
+    assert welcome is not None, "welcome was not forwarded to connect_and_register"
+    # Single source of truth: same auto-derived shape ``handle_welcome``
+    # returns. Verify the load-bearing identity + skill-catalog fields.
+    assert welcome["agent_id"] == "welcome-test"
+    assert welcome["agent_type"] == "echo"
+    assert welcome["skill_count"] == 6  # echo, upper, fail, health_check, welcome, help
+
+
+@pytest.mark.asyncio
+async def test_start_registers_without_welcome_if_handle_welcome_fails(monkeypatch):
+    """Defensive: a buggy handle_welcome override must not block the agent
+    from registering. The connector receives welcome=None and the agent
+    stays callable.
+    """
+    captured: dict = {}
+
+    async def fake_connect_and_register(self, **kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("intercepted; not opening WS")
+
+    from khonliang_bus.connector import BusConnector
+
+    monkeypatch.setattr(BusConnector, "connect_and_register", fake_connect_and_register)
+
+    class BrokenWelcomeAgent(EchoAgent):
+        async def handle_welcome(self, args):
+            raise ValueError("buggy override")
+
+    a = BrokenWelcomeAgent(agent_id="broken-welcome", bus_url="http://localhost:1")
+    with pytest.raises(RuntimeError, match="intercepted"):
+        await a.start()
+    assert captured.get("welcome") is None
+    # Other fields still passed.
+    assert captured.get("agent_type") == "echo"
+    assert captured.get("skills") is not None
+
+
 # -- helpers exist --
 
 def test_publish_is_async(agent):

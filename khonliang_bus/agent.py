@@ -1115,6 +1115,26 @@ class BaseAgent:
         launch_spec = capture_launch_spec()
         launch_info = capture_launch_info()
 
+        # Compute welcome at startup so the bus can persist it alongside the
+        # registration. Same shape as ``handle_welcome`` returns (single
+        # source of truth — no per-agent re-implementation). Bus stores this
+        # in a survives-deregister catalog so ``bus_welcome`` super-skill +
+        # ``GET /v1/agents/<id>/welcome`` work even after the agent process
+        # exits. See fr_khonliang-bus_f96722dd.
+        #
+        # Defensive: a malformed Welcome / handle_welcome override should
+        # not block registration — log and proceed without the field, so
+        # the agent stays callable.
+        try:
+            welcome = await self.handle_welcome({"detail": "full"})
+        except Exception as e:  # pragma: no cover - exercised in tests
+            logger.warning(
+                "Agent %s: handle_welcome raised at start(); "
+                "registering without welcome payload: %s",
+                self.agent_id, e,
+            )
+            welcome = None
+
         # Connect and register (raises RuntimeError if bus is unreachable).
         # Wrap in try/finally so _http is cleaned up on failure.
         try:
@@ -1134,6 +1154,7 @@ class BaseAgent:
                 ],
                 launch_spec=launch_spec,
                 launch_info=launch_info,
+                welcome=welcome,
             )
 
         except Exception:

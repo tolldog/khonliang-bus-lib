@@ -710,7 +710,24 @@ class BaseAgent:
         if detail not in {"compact", "brief", "full"}:
             return {"error": f"detail must be one of compact|brief|full (got {detail!r})"}
 
-        return self._compose_welcome(self._all_skills(), detail)
+        # ``_skills`` is a reserved internal arg used by ``start()`` to pass
+        # an already-computed skills list. Skipping the re-call into
+        # ``_all_skills()`` avoids a subtle divergence: if ``register_skills()``
+        # is dynamic / side-effecting, two calls could disagree, making the
+        # auto-published welcome's catalog drift from what bus actually
+        # registered. External callers don't supply this key; the bus's
+        # request schema doesn't advertise it. Closes Copilot PR #25 R2 / R3
+        # — by routing start() through ``handle_welcome`` (rather than the
+        # private ``_compose_welcome``), an agent that overrides
+        # ``handle_welcome`` to customize welcome shape sees its
+        # customization reflected in the persisted-at-register welcome too.
+        precomputed = args.get("_skills")
+        skills = (
+            precomputed
+            if isinstance(precomputed, list)
+            else self._all_skills()
+        )
+        return self._compose_welcome(skills, detail)
 
     def _compose_welcome(self, skills: list[Skill], detail: str) -> dict[str, Any]:
         """Build the welcome payload from a precomputed skills list.
@@ -1136,34 +1153,37 @@ class BaseAgent:
         # ``GET /v1/agents/<id>/welcome`` work even after the agent process
         # exits. See fr_khonliang-bus_f96722dd.
         #
-        # Crucially: pass the already-computed ``skills`` list rather than
-        # letting ``_compose_welcome`` call ``_all_skills()`` again. A
-        # ``register_skills()`` override that is dynamic / side-effecting
-        # could yield a different result on the second call, making the
-        # auto-published welcome's skill catalog disagree with what was
-        # actually registered. fr_khonliang-bus_f96722dd / Copilot PR #25 R2.
+        # Route through ``handle_welcome`` (not the private ``_compose_welcome``
+        # directly) so an agent that overrides ``handle_welcome`` to customize
+        # welcome shape sees that customization reflected in the persisted-
+        # at-register welcome too. The reserved ``_skills`` arg passes the
+        # already-computed skills list — avoids a second ``_all_skills()``
+        # call where a dynamic ``register_skills()`` override could otherwise
+        # yield a different result and make the auto-published welcome's
+        # catalog drift from what bus actually registered.
+        # fr_khonliang-bus_f96722dd / Copilot PR #25 R2 + R3.
         #
-        # Defensive: a malformed Welcome / _compose_welcome override must not
+        # Defensive: a malformed Welcome / handle_welcome override must not
         # block registration. Three independent failure modes get the same
         # treatment (log + welcome=None + continue), so a buggy welcome
         # never holds an agent off the bus:
-        #   (1) the compose call raises.
+        #   (1) the welcome call raises.
         #   (2) it returns a non-dict (bus's persist path expects dict).
         #   (3) it returns a dict containing non-JSON-serializable values —
         #       would later raise inside connect_and_register's json.dumps.
         welcome: dict | None = None
         try:
-            candidate = self._compose_welcome(skills, "full")
+            candidate = await self.handle_welcome({"detail": "full", "_skills": skills})
         except Exception:
             logger.exception(
-                "Agent %s: _compose_welcome raised at start(); "
+                "Agent %s: handle_welcome raised at start(); "
                 "registering without welcome payload",
                 self.agent_id,
             )
         else:
             if not isinstance(candidate, dict):
                 logger.warning(
-                    "Agent %s: _compose_welcome returned %s, not dict; "
+                    "Agent %s: handle_welcome returned %s, not dict; "
                     "registering without welcome payload",
                     self.agent_id, type(candidate).__name__,
                 )
@@ -1172,7 +1192,7 @@ class BaseAgent:
                     json.dumps(candidate)  # serializability check
                 except (TypeError, ValueError):
                     logger.exception(
-                        "Agent %s: _compose_welcome returned a non-JSON-"
+                        "Agent %s: handle_welcome returned a non-JSON-"
                         "serializable dict; registering without welcome "
                         "payload",
                         self.agent_id,

@@ -219,14 +219,14 @@ def capture_connect(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_start_registers_without_welcome_if_compose_welcome_raises(capture_connect):
-    """Defensive: a buggy ``_compose_welcome`` override (or a custom
+async def test_start_registers_without_welcome_if_handle_welcome_raises(capture_connect):
+    """Defensive: a buggy ``handle_welcome`` override (or a custom
     ``WELCOME`` with __post_init__ that throws) must not block the agent
     from registering. The connector receives welcome=None and the agent
     stays callable.
     """
     class BrokenWelcomeAgent(EchoAgent):
-        def _compose_welcome(self, skills, detail):
+        async def handle_welcome(self, args):
             raise ValueError("buggy override")
 
     a = BrokenWelcomeAgent(agent_id="broken-welcome", bus_url="http://localhost:1")
@@ -239,15 +239,15 @@ async def test_start_registers_without_welcome_if_compose_welcome_raises(capture
 
 
 @pytest.mark.asyncio
-async def test_start_registers_without_welcome_if_compose_returns_non_dict(capture_connect):
-    """Defensive: a ``_compose_welcome`` override that returns a non-dict
+async def test_start_registers_without_welcome_if_handle_welcome_returns_non_dict(capture_connect):
+    """Defensive: a ``handle_welcome`` override that returns a non-dict
     (list, string, None, …) must not propagate to the bus's persist path.
     The bus stores only dicts; a non-dict here would either be silently
     discarded on the bus side or — worse — fail later inside
     ``json.dumps``. Drop it at source for a clean wire shape.
     """
     class StringWelcomeAgent(EchoAgent):
-        def _compose_welcome(self, skills, detail):
+        async def handle_welcome(self, args):
             return "this is not a dict"
 
     a = StringWelcomeAgent(agent_id="string-welcome", bus_url="http://localhost:1")
@@ -265,7 +265,7 @@ async def test_start_registers_without_welcome_if_dict_is_not_json_serializable(
     drops the value if it can't be encoded.
     """
     class UnserializableWelcomeAgent(EchoAgent):
-        def _compose_welcome(self, skills, detail):
+        async def handle_welcome(self, args):
             return {"agent_id": "x", "broken_field": object()}
 
     a = UnserializableWelcomeAgent(agent_id="unserializable", bus_url="http://localhost:1")
@@ -275,11 +275,38 @@ async def test_start_registers_without_welcome_if_dict_is_not_json_serializable(
 
 
 @pytest.mark.asyncio
+async def test_start_propagates_handle_welcome_override(capture_connect):
+    """Copilot PR #25 R3: an agent that overrides ``handle_welcome`` to
+    customize welcome shape must see that customization reflected in the
+    persisted-at-register welcome too. ``start()`` routes through
+    ``handle_welcome`` (not the private ``_compose_welcome``) so override
+    semantics stay symmetric between live MCP calls and the autopublish path.
+    """
+    class CustomWelcomeAgent(EchoAgent):
+        async def handle_welcome(self, args):
+            return {
+                "agent_id": self.agent_id,
+                "agent_type": self.agent_type,
+                "version": self.version,
+                "custom_marker": "override-saw-this",
+            }
+
+    a = CustomWelcomeAgent(agent_id="custom-welcome", bus_url="http://localhost:1")
+    with pytest.raises(RuntimeError, match="intercepted"):
+        await a.start()
+    welcome = capture_connect.get("welcome")
+    assert welcome is not None
+    # Override's custom marker survived the autopublish path.
+    assert welcome["custom_marker"] == "override-saw-this"
+
+
+@pytest.mark.asyncio
 async def test_start_uses_precomputed_skills_for_welcome(capture_connect):
     """Copilot PR #25 R2: ``register_skills()`` overrides that are dynamic
     must not cause the auto-published welcome to disagree with the
     registered skill set. ``start()`` computes ``skills`` once and passes
-    that same list into ``_compose_welcome`` instead of letting it call
+    that same list via the reserved ``_skills`` arg into ``handle_welcome``,
+    which forwards it to ``_compose_welcome`` instead of calling
     ``_all_skills()`` again.
 
     We verify by counting how often ``_all_skills`` runs during start():
@@ -295,25 +322,35 @@ async def test_start_uses_precomputed_skills_for_welcome(capture_connect):
     a = CountingAgent(agent_id="counted", bus_url="http://localhost:1")
     with pytest.raises(RuntimeError, match="intercepted"):
         await a.start()
-    # One call, total. If _compose_welcome had re-called _all_skills, this
+    # One call, total. If handle_welcome had re-called _all_skills, this
     # would be 2 (regression marker).
     assert call_count["n"] == 1
 
 
 @pytest.mark.asyncio
-async def test_handle_welcome_still_works_for_runtime_calls(agent):
-    """Refactor sanity check: ``handle_welcome`` (the live MCP-visible path,
-    invoked at runtime via ``_dispatch_request``) still produces the same
-    shape after factoring the logic into ``_compose_welcome``. Verified
-    against the same EchoAgent fixture used by the canonical welcome
-    tests.
+async def test_handle_welcome_runtime_call_still_computes_skills(agent):
+    """Runtime MCP path (no ``_skills`` arg) falls back to ``_all_skills()``
+    — the reserved-arg shortcut is exclusively for ``start()``'s autopublish.
+    Verifies the override hook stays backward-compatible for live calls.
     """
     result = await agent._dispatch_request({"operation": "welcome", "args": {"detail": "full"}})
-    # Same load-bearing fields the existing
-    # test_welcome_default_full_lists_per_skill_documentation_gaps checks.
     assert result["agent_id"] == "echo-test"
     assert result["skill_count"] == 6
     assert "skills_by_category" in result
+
+
+@pytest.mark.asyncio
+async def test_handle_welcome_ignores_non_list_skills_hint(agent):
+    """The reserved ``_skills`` arg is honored only when it's a list — a
+    malformed external caller can't poison the runtime welcome by passing
+    a non-list value via the MCP surface.
+    """
+    # Pass a non-list value; should ignore + fall back to _all_skills().
+    result = await agent._dispatch_request({
+        "operation": "welcome",
+        "args": {"detail": "full", "_skills": "not-a-list"},
+    })
+    assert result["skill_count"] == 6  # full real catalog, not 0 or error
 
 
 # -- helpers exist --

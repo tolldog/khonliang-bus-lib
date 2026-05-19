@@ -136,8 +136,14 @@ class BusConnector:
                 f"{ws_url}: {e}. The bus must be running before agents can start."
             ) from e
 
-        # Send registration
-        await self._ws.send(json.dumps(self._registration_payload))
+        # Send registration. ``allow_nan=False`` makes ``json.dumps`` reject
+        # NaN / Infinity values (which the default lenient mode emits as
+        # the non-RFC tokens ``NaN`` / ``Infinity`` — invalid JSON the bus
+        # would later fail to parse). Strict mode here is defense-in-depth:
+        # the agent-side welcome guard already filters this case, but a
+        # future field added to the register payload should also fail loud
+        # at send rather than poison the wire. Closes Copilot PR #25 R5 #3.
+        await self._ws.send(json.dumps(self._registration_payload, allow_nan=False))
         resp = json.loads(await self._ws.recv())
         if resp.get("type") != "registered":
             await self._ws.close()
@@ -204,7 +210,9 @@ class BusConnector:
                 ws_url = self._ws_url("/v1/agent")
                 new_ws = await websockets.connect(ws_url)
                 if self._registration_payload:
-                    await new_ws.send(json.dumps(self._registration_payload))
+                    # ``allow_nan=False`` — same strict-encoding rationale as
+                    # the initial register at line ~140. Closes Copilot PR #25 R5 #3.
+                    await new_ws.send(json.dumps(self._registration_payload, allow_nan=False))
                     resp = json.loads(await new_ws.recv())
                     if resp.get("type") != "registered":
                         await new_ws.close()
@@ -254,7 +262,11 @@ class BusConnector:
         :meth:`~khonliang_bus.agent.BaseAgent.publish` which raises on disconnect).
         """
         if self._ws and self._is_open():
-            await self._ws.send(json.dumps(msg))
+            # ``allow_nan=False`` — strict-encoding for all outbound wire
+            # messages (responses, publishes, gaps, feedback). Catches
+            # NaN/Inf bugs in skill responses at send rather than poisoning
+            # the bus's JSON parser. Closes Copilot PR #25 R5 #3.
+            await self._ws.send(json.dumps(msg, allow_nan=False))
         else:
             logger.warning(
                 "Agent %s: message dropped (not connected): type=%s",

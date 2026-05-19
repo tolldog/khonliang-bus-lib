@@ -1179,6 +1179,15 @@ class BaseAgent:
         welcome: dict | None = None
         try:
             candidate = await self.handle_welcome({"detail": "full", "_skills": skills})
+        except asyncio.CancelledError:
+            # Cancellation during startup (the surrounding task got
+            # cancelled) must propagate — don't swallow it into the
+            # "welcome failed, continue registering" path. In Python 3.8+
+            # CancelledError is a BaseException subclass (NOT under
+            # Exception), but make the intent explicit for readability and
+            # to defend against future stdlib changes. Closes Copilot PR
+            # #25 R5 #1.
+            raise
         except Exception:
             logger.exception(
                 "Agent %s: handle_welcome raised at start(); "
@@ -1194,15 +1203,24 @@ class BaseAgent:
                 )
             else:
                 try:
-                    json.dumps(candidate)  # serializability check
+                    # ``allow_nan=False`` makes ``json.dumps`` reject NaN /
+                    # +Infinity / -Infinity (which the default lenient mode
+                    # would emit as the non-RFC tokens ``NaN`` / ``Infinity``
+                    # — invalid JSON the bus's standard parser would later
+                    # reject, breaking the register handshake). Strict mode
+                    # here means an oversighted welcome with ``inf``/``nan``
+                    # values is filtered at the agent rather than poisoning
+                    # the wire. Closes Copilot PR #25 R5 #2.
+                    json.dumps(candidate, allow_nan=False)
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    raise
                 except Exception:
-                    # Broad catch is deliberate. ``json.dumps`` can raise more
-                    # than TypeError/ValueError — OverflowError on out-of-range
-                    # numbers (``float('inf')``, ``float('nan')``), RecursionError
-                    # on deep nesting, and custom encoders may surface anything.
-                    # Any failure here means the welcome cannot reach the bus
-                    # alive; the registration must still proceed. Closes
-                    # Copilot PR #25 R4 #2.
+                    # Broad catch is deliberate. ``json.dumps`` raises a
+                    # mix of TypeError / ValueError / OverflowError /
+                    # RecursionError / custom-encoder errors depending on
+                    # the offending value. Any failure means the welcome
+                    # cannot reach the bus alive; registration must still
+                    # proceed. Closes Copilot PR #25 R4 #2.
                     logger.exception(
                         "Agent %s: handle_welcome returned a non-JSON-"
                         "serializable dict; registering without welcome "

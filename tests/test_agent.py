@@ -396,6 +396,61 @@ async def test_handle_welcome_accepts_list_of_skill_instances(agent):
 
 
 @pytest.mark.asyncio
+async def test_start_drops_welcome_with_nan_or_inf(capture_connect):
+    """Copilot PR #25 R5 #2: a welcome containing NaN / +Infinity / -Infinity
+    values fails the strict ``allow_nan=False`` serializability check
+    and is dropped. Default ``json.dumps`` would happily emit the non-
+    RFC tokens (``NaN``, ``Infinity``) — invalid JSON the bus's parser
+    would later reject, breaking the register handshake.
+    """
+    class NanWelcomeAgent(EchoAgent):
+        async def handle_welcome(self, args):
+            return {"agent_id": "x", "score": float("nan")}
+
+    a = NanWelcomeAgent(agent_id="nan", bus_url="http://localhost:1")
+    with pytest.raises(RuntimeError, match="intercepted"):
+        await a.start()
+    assert capture_connect.get("welcome") is None
+
+
+@pytest.mark.asyncio
+async def test_start_drops_welcome_with_infinity(capture_connect):
+    """Same class as NaN — strict-mode serializability filter."""
+    class InfWelcomeAgent(EchoAgent):
+        async def handle_welcome(self, args):
+            return {"agent_id": "x", "size": float("inf")}
+
+    a = InfWelcomeAgent(agent_id="inf", bus_url="http://localhost:1")
+    with pytest.raises(RuntimeError, match="intercepted"):
+        await a.start()
+    assert capture_connect.get("welcome") is None
+
+
+@pytest.mark.asyncio
+async def test_start_propagates_cancellation_during_handle_welcome(capture_connect):
+    """Copilot PR #25 R5 #1: ``asyncio.CancelledError`` (Py 3.8+: now a
+    BaseException subclass, but defensible to handle explicitly) must
+    propagate, not get swallowed by the welcome-failure recovery path.
+    Otherwise a cancelled startup would silently continue to register
+    instead of cooperatively unwinding.
+    """
+    import asyncio
+
+    class CancellingWelcomeAgent(EchoAgent):
+        async def handle_welcome(self, args):
+            raise asyncio.CancelledError()
+
+    a = CancellingWelcomeAgent(agent_id="cancelled", bus_url="http://localhost:1")
+    # The CancelledError propagates out of start() — not caught by the
+    # broad except Exception block.
+    with pytest.raises(asyncio.CancelledError):
+        await a.start()
+    # And the register call never happened (connector was never invoked).
+    assert "welcome" not in capture_connect
+    assert "agent_type" not in capture_connect
+
+
+@pytest.mark.asyncio
 async def test_start_survives_circular_reference_in_welcome(capture_connect):
     """Circular references make ``json.dumps`` raise ``ValueError`` at the
     default ``check_circular=True``. Already inside (TypeError, ValueError)

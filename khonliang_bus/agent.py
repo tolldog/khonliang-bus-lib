@@ -722,13 +722,24 @@ class BaseAgent:
         # ``handle_welcome`` to customize welcome shape sees its
         # customization reflected in the persisted-at-register welcome too.
         #
-        # Strict acceptance: ``_skills`` must be a list of ``Skill`` instances.
-        # Anything else (list of strings, dicts, mixed types — possible if
-        # an external MCP caller injects the key) falls back to the safe
-        # ``_all_skills()`` path so ``_compose_welcome`` doesn't crash on
-        # ``s.name`` later. Closes Copilot PR #25 R4 #1.
+        # Strict acceptance: ``_skills`` must be a NON-EMPTY list of
+        # ``Skill`` instances. Anything else (list of strings, dicts, mixed
+        # types — possible if an external MCP caller injects the key) falls
+        # back to the safe ``_all_skills()`` path so ``_compose_welcome``
+        # doesn't crash on ``s.name`` later. The non-empty requirement
+        # closes Copilot PR #25 R8 #1: ``all(isinstance(s, Skill) for s in
+        # [])`` is vacuously True, so an empty-list injection would
+        # otherwise force ``skill_count=0`` welcomes. ``start()`` always
+        # passes a non-empty list (``_all_skills()`` returns at least the
+        # ``BUILT_IN_SKILLS`` tuple), so the empty-list shortcut path
+        # cannot fire on the legitimate autopublish call.
+        # Closes Copilot PR #25 R4 #1 / R8 #1.
         precomputed = args.get("_skills")
-        if isinstance(precomputed, list) and all(isinstance(s, Skill) for s in precomputed):
+        if (
+            isinstance(precomputed, list)
+            and precomputed  # non-empty
+            and all(isinstance(s, Skill) for s in precomputed)
+        ):
             skills = precomputed
         else:
             skills = self._all_skills()
@@ -1214,7 +1225,7 @@ class BaseAgent:
                     # would emit as the non-RFC tokens ``NaN`` / ``Infinity``
                     # — invalid JSON the bus's standard parser would later
                     # reject, breaking the register handshake). Strict mode
-                    # here means an oversighted welcome with ``inf``/``nan``
+                    # here means an overlooked welcome with ``inf``/``nan``
                     # values is filtered at the agent rather than poisoning
                     # the wire. Closes Copilot PR #25 R5 #2.
                     json.dumps(candidate, allow_nan=False)

@@ -354,6 +354,25 @@ async def test_handle_welcome_ignores_non_list_skills_hint(agent):
 
 
 @pytest.mark.asyncio
+async def test_handle_welcome_ignores_empty_skills_hint(agent):
+    """Copilot PR #25 R8 #1: an external caller passing ``_skills=[]``
+    could force a welcome with ``skill_count=0`` if we accepted any list
+    that passes the all-Skill check (vacuously true for empty). The
+    fix requires the list to be non-empty before trusting it.
+
+    ``start()`` cannot legitimately hit this path because
+    ``_all_skills()`` always returns the ``BUILT_IN_SKILLS`` tuple plus
+    any subclass-declared skills — never empty.
+    """
+    result = await agent._dispatch_request({
+        "operation": "welcome",
+        "args": {"detail": "full", "_skills": []},
+    })
+    # Real catalog returned, not zero.
+    assert result["skill_count"] == 6
+
+
+@pytest.mark.asyncio
 async def test_handle_welcome_ignores_list_of_non_skills(agent):
     """Copilot PR #25 R4 #1: ``_skills`` may be a list, but if elements
     aren't ``Skill`` instances ``_compose_welcome`` would crash on

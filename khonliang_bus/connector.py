@@ -291,10 +291,23 @@ class BusConnector:
     async def send(self, msg: dict) -> None:
         """Send a message to the bus.
 
-        Logs a warning and drops the message if the WebSocket is not open.
+        Two warn-and-drop conditions; neither raises:
+
+        - WebSocket is not open (the original behavior).
+        - ``msg`` contains values that ``json.dumps(..., allow_nan=False)``
+          can't encode — NaN / Infinity, ``object()``, ``set``, custom
+          objects without an encoder, or anything that triggers
+          ``OverflowError`` / ``RecursionError`` / a custom-encoder error.
+          Strict encoding here prevents non-RFC JSON from poisoning the
+          bus's parser; a dropped message is preferable to a wire-level
+          protocol error.
+
         Callers that need delivery guarantees should check
         :attr:`connected` themselves (or use the higher-level
-        :meth:`~khonliang_bus.agent.BaseAgent.publish` which raises on disconnect).
+        :meth:`~khonliang_bus.agent.BaseAgent.publish` which raises on
+        disconnect). There is currently no surface that raises on
+        serialization failure — the log line is the only signal that an
+        outbound message was dropped for that reason.
         """
         if self._ws and self._is_open():
             # ``allow_nan=False`` — strict-encoding for all outbound wire

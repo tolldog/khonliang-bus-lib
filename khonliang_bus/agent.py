@@ -710,8 +710,22 @@ class BaseAgent:
         if detail not in {"compact", "brief", "full"}:
             return {"error": f"detail must be one of compact|brief|full (got {detail!r})"}
 
-        skills = self._all_skills()
+        return self._compose_welcome(self._all_skills(), detail)
 
+    def _compose_welcome(self, skills: list[Skill], detail: str) -> dict[str, Any]:
+        """Build the welcome payload from a precomputed skills list.
+
+        Factored out of ``handle_welcome`` so ``start()`` can compute
+        ``skills = self._all_skills()`` exactly once and pass it to both
+        the register handshake AND the auto-published welcome — avoiding
+        the prior subtle bug where ``register_skills()`` overrides with
+        side-effects could yield a welcome whose ``skill_count`` /
+        ``skills_by_category`` disagreed with what bus actually
+        registered. fr_khonliang-bus_f96722dd / Copilot PR #25 R2.
+
+        ``detail`` is one of ``compact``/``brief``/``full`` —
+        ``handle_welcome`` already validates the value.
+        """
         out: dict[str, Any] = {
             "agent_id": self.agent_id,
             "agent_type": self.agent_type,
@@ -1122,29 +1136,34 @@ class BaseAgent:
         # ``GET /v1/agents/<id>/welcome`` work even after the agent process
         # exits. See fr_khonliang-bus_f96722dd.
         #
-        # Defensive: a malformed Welcome / handle_welcome override must not
+        # Crucially: pass the already-computed ``skills`` list rather than
+        # letting ``_compose_welcome`` call ``_all_skills()`` again. A
+        # ``register_skills()`` override that is dynamic / side-effecting
+        # could yield a different result on the second call, making the
+        # auto-published welcome's skill catalog disagree with what was
+        # actually registered. fr_khonliang-bus_f96722dd / Copilot PR #25 R2.
+        #
+        # Defensive: a malformed Welcome / _compose_welcome override must not
         # block registration. Three independent failure modes get the same
         # treatment (log + welcome=None + continue), so a buggy welcome
         # never holds an agent off the bus:
-        #   (1) handle_welcome raises.
-        #   (2) handle_welcome returns a non-dict (json.dumps would still
-        #       work for some types but the bus's persist path expects dict).
-        #   (3) handle_welcome returns a dict containing non-JSON-serializable
-        #       values — would later raise inside connect_and_register's
-        #       json.dumps.
+        #   (1) the compose call raises.
+        #   (2) it returns a non-dict (bus's persist path expects dict).
+        #   (3) it returns a dict containing non-JSON-serializable values —
+        #       would later raise inside connect_and_register's json.dumps.
         welcome: dict | None = None
         try:
-            candidate = await self.handle_welcome({"detail": "full"})
+            candidate = self._compose_welcome(skills, "full")
         except Exception:
             logger.exception(
-                "Agent %s: handle_welcome raised at start(); "
+                "Agent %s: _compose_welcome raised at start(); "
                 "registering without welcome payload",
                 self.agent_id,
             )
         else:
             if not isinstance(candidate, dict):
                 logger.warning(
-                    "Agent %s: handle_welcome returned %s, not dict; "
+                    "Agent %s: _compose_welcome returned %s, not dict; "
                     "registering without welcome payload",
                     self.agent_id, type(candidate).__name__,
                 )
@@ -1153,7 +1172,7 @@ class BaseAgent:
                     json.dumps(candidate)  # serializability check
                 except (TypeError, ValueError):
                     logger.exception(
-                        "Agent %s: handle_welcome returned a non-JSON-"
+                        "Agent %s: _compose_welcome returned a non-JSON-"
                         "serializable dict; registering without welcome "
                         "payload",
                         self.agent_id,

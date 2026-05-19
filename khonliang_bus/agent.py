@@ -1181,12 +1181,18 @@ class BaseAgent:
             candidate = await self.handle_welcome({"detail": "full", "_skills": skills})
         except asyncio.CancelledError:
             # Cancellation during startup (the surrounding task got
-            # cancelled) must propagate — don't swallow it into the
-            # "welcome failed, continue registering" path. In Python 3.8+
-            # CancelledError is a BaseException subclass (NOT under
-            # Exception), but make the intent explicit for readability and
-            # to defend against future stdlib changes. Closes Copilot PR
-            # #25 R5 #1.
+            # cancelled) must propagate, not get swallowed into the
+            # "welcome failed, continue registering" recovery path.
+            #
+            # Python facts (per https://docs.python.org/3/library/
+            # asyncio-exceptions.html#asyncio.CancelledError): since Py 3.8
+            # ``CancelledError`` inherits from ``BaseException`` rather than
+            # ``Exception``, so the broad ``except Exception`` below would
+            # NOT catch it on supported Python versions. This explicit
+            # ``except asyncio.CancelledError: raise`` is therefore
+            # defensive — redundant against today's stdlib but documents
+            # intent and defends against a future maintainer widening to
+            # ``except BaseException``. Closes Copilot PR #25 R5 #1 / R6 #1.
             raise
         except Exception:
             logger.exception(

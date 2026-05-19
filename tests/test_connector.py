@@ -212,6 +212,74 @@ async def test_connect_and_register_carries_all_three_extension_fields():
     assert payload["welcome"] == welcome
 
 
+# ---------------------------------------------------------------------------
+# Strict JSON encoding contract (Copilot PR #25 R6 #2, #3): serialization
+# failures must honor each method's documented exception surface, not
+# leak the underlying ValueError/TypeError.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_connect_and_register_raises_runtime_error_on_nan_payload():
+    """``connect_and_register`` docstring promises ``RuntimeError`` on
+    registration failure. A payload containing NaN (rejected by
+    ``allow_nan=False``) must surface as RuntimeError, not the raw
+    ``ValueError`` ``json.dumps`` raises.
+    """
+    c = BusConnector("http://localhost:1", "test-agent")
+    bad_welcome = {"agent_id": "t", "score": float("nan")}
+    with pytest.raises(RuntimeError, match="not JSON-encodable"):
+        await c.connect_and_register(
+            agent_type="test", version="0.1.0", pid=1, skills=[],
+            welcome=bad_welcome,
+        )
+
+
+@pytest.mark.asyncio
+async def test_connect_and_register_raises_runtime_error_on_non_serializable_payload():
+    """Non-JSON-serializable values (e.g. ``object()``, ``set``,
+    functions) trigger ``TypeError`` inside ``json.dumps``. Same
+    contract — surface as RuntimeError.
+    """
+    c = BusConnector("http://localhost:1", "test-agent")
+    bad_welcome = {"agent_id": "t", "broken": object()}
+    with pytest.raises(RuntimeError, match="not JSON-encodable"):
+        await c.connect_and_register(
+            agent_type="test", version="0.1.0", pid=1, skills=[],
+            welcome=bad_welcome,
+        )
+
+
+@pytest.mark.asyncio
+async def test_send_drops_unserializable_message_without_raising(caplog):
+    """``send()`` docstring contract: warns-and-drops on problems out of
+    the caller's control. A NaN/Inf or non-serializable value falls into
+    that category — log warning + drop, don't propagate ValueError.
+    """
+    import logging
+    from unittest.mock import AsyncMock, MagicMock
+    from websockets.protocol import State
+
+    c = BusConnector("http://localhost:1", "test-agent")
+    # Stub _ws so _is_open() returns True without a real socket.
+    fake_ws = MagicMock()
+    fake_ws.send = AsyncMock()
+    fake_ws.state = State.OPEN  # _is_open does ``ws.state == State.OPEN``
+    c._ws = fake_ws
+
+    with caplog.at_level(logging.WARNING):
+        # NaN trips allow_nan=False. The whole call must not raise.
+        await c.send({"type": "response", "value": float("nan")})
+
+    # Nothing went on the wire.
+    fake_ws.send.assert_not_awaited()
+    # Warning logged with type info.
+    assert any(
+        "not JSON-encodable" in r.message and "response" in r.message
+        for r in caplog.records
+    )
+
+
 def test_is_open_v14_state():
     """_is_open uses .state for websockets v14+ (no .open attribute)."""
     from unittest.mock import MagicMock

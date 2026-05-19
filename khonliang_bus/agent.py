@@ -1122,18 +1122,44 @@ class BaseAgent:
         # ``GET /v1/agents/<id>/welcome`` work even after the agent process
         # exits. See fr_khonliang-bus_f96722dd.
         #
-        # Defensive: a malformed Welcome / handle_welcome override should
-        # not block registration — log and proceed without the field, so
-        # the agent stays callable.
+        # Defensive: a malformed Welcome / handle_welcome override must not
+        # block registration. Three independent failure modes get the same
+        # treatment (log + welcome=None + continue), so a buggy welcome
+        # never holds an agent off the bus:
+        #   (1) handle_welcome raises.
+        #   (2) handle_welcome returns a non-dict (json.dumps would still
+        #       work for some types but the bus's persist path expects dict).
+        #   (3) handle_welcome returns a dict containing non-JSON-serializable
+        #       values — would later raise inside connect_and_register's
+        #       json.dumps.
+        welcome: dict | None = None
         try:
-            welcome = await self.handle_welcome({"detail": "full"})
-        except Exception as e:  # pragma: no cover - exercised in tests
-            logger.warning(
+            candidate = await self.handle_welcome({"detail": "full"})
+        except Exception:
+            logger.exception(
                 "Agent %s: handle_welcome raised at start(); "
-                "registering without welcome payload: %s",
-                self.agent_id, e,
+                "registering without welcome payload",
+                self.agent_id,
             )
-            welcome = None
+        else:
+            if not isinstance(candidate, dict):
+                logger.warning(
+                    "Agent %s: handle_welcome returned %s, not dict; "
+                    "registering without welcome payload",
+                    self.agent_id, type(candidate).__name__,
+                )
+            else:
+                try:
+                    json.dumps(candidate)  # serializability check
+                except (TypeError, ValueError):
+                    logger.exception(
+                        "Agent %s: handle_welcome returned a non-JSON-"
+                        "serializable dict; registering without welcome "
+                        "payload",
+                        self.agent_id,
+                    )
+                else:
+                    welcome = candidate
 
         # Connect and register (raises RuntimeError if bus is unreachable).
         # Wrap in try/finally so _http is cleaned up on failure.

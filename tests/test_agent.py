@@ -182,26 +182,16 @@ async def test_start_fails_when_bus_unreachable():
 #    without per-agent boilerplate.
 
 @pytest.mark.asyncio
-async def test_start_passes_welcome_to_connector(monkeypatch):
+async def test_start_passes_welcome_to_connector(capture_connect):
     """BaseAgent.start() computes its own welcome (via handle_welcome) and
     forwards it to BusConnector.connect_and_register. Verified by capturing
     the kwargs the connector receives — no real WebSocket is opened.
     """
-    captured: dict = {}
-
-    async def fake_connect_and_register(self, **kwargs):
-        captured.update(kwargs)
-        raise RuntimeError("intercepted; not opening WS")
-
-    from khonliang_bus.connector import BusConnector
-
-    monkeypatch.setattr(BusConnector, "connect_and_register", fake_connect_and_register)
-
     a = EchoAgent(agent_id="welcome-test", bus_url="http://localhost:1")
     with pytest.raises(RuntimeError, match="intercepted"):
         await a.start()
 
-    welcome = captured.get("welcome")
+    welcome = capture_connect.get("welcome")
     assert welcome is not None, "welcome was not forwarded to connect_and_register"
     # Single source of truth: same auto-derived shape ``handle_welcome``
     # returns. Verify the load-bearing identity + skill-catalog fields.
@@ -210,22 +200,30 @@ async def test_start_passes_welcome_to_connector(monkeypatch):
     assert welcome["skill_count"] == 6  # echo, upper, fail, health_check, welcome, help
 
 
-@pytest.mark.asyncio
-async def test_start_registers_without_welcome_if_handle_welcome_fails(monkeypatch):
-    """Defensive: a buggy handle_welcome override must not block the agent
-    from registering. The connector receives welcome=None and the agent
-    stays callable.
+@pytest.fixture
+def capture_connect(monkeypatch):
+    """Stub BusConnector.connect_and_register to capture kwargs without
+    opening a real WebSocket. Returns the dict the captured kwargs land
+    in, so tests can assert what start() forwarded.
     """
     captured: dict = {}
 
-    async def fake_connect_and_register(self, **kwargs):
+    async def fake(self, **kwargs):
         captured.update(kwargs)
         raise RuntimeError("intercepted; not opening WS")
 
     from khonliang_bus.connector import BusConnector
 
-    monkeypatch.setattr(BusConnector, "connect_and_register", fake_connect_and_register)
+    monkeypatch.setattr(BusConnector, "connect_and_register", fake)
+    return captured
 
+
+@pytest.mark.asyncio
+async def test_start_registers_without_welcome_if_handle_welcome_fails(capture_connect):
+    """Defensive: a buggy handle_welcome override must not block the agent
+    from registering. The connector receives welcome=None and the agent
+    stays callable.
+    """
     class BrokenWelcomeAgent(EchoAgent):
         async def handle_welcome(self, args):
             raise ValueError("buggy override")
@@ -233,10 +231,45 @@ async def test_start_registers_without_welcome_if_handle_welcome_fails(monkeypat
     a = BrokenWelcomeAgent(agent_id="broken-welcome", bus_url="http://localhost:1")
     with pytest.raises(RuntimeError, match="intercepted"):
         await a.start()
-    assert captured.get("welcome") is None
+    assert capture_connect.get("welcome") is None
     # Other fields still passed.
-    assert captured.get("agent_type") == "echo"
-    assert captured.get("skills") is not None
+    assert capture_connect.get("agent_type") == "echo"
+    assert capture_connect.get("skills") is not None
+
+
+@pytest.mark.asyncio
+async def test_start_registers_without_welcome_if_handle_welcome_returns_non_dict(capture_connect):
+    """Defensive: a handle_welcome override that returns a list / string /
+    None must not break registration. ``connect_and_register`` would later
+    have asserted on the wire shape; we drop the value here so registration
+    completes cleanly.
+    """
+    class StringWelcomeAgent(EchoAgent):
+        async def handle_welcome(self, args):
+            return "this is not a dict"
+
+    a = StringWelcomeAgent(agent_id="string-welcome", bus_url="http://localhost:1")
+    with pytest.raises(RuntimeError, match="intercepted"):
+        await a.start()
+    assert capture_connect.get("welcome") is None
+
+
+@pytest.mark.asyncio
+async def test_start_registers_without_welcome_if_dict_is_not_json_serializable(capture_connect):
+    """Defensive: a dict containing non-JSON-serializable values (e.g. a
+    raw object, a set, a circular reference, a function reference) would
+    later fail in ``json.dumps`` inside connect_and_register and block
+    registration. The agent verifies serializability at capture time and
+    drops the value if it can't be encoded.
+    """
+    class UnserializableWelcomeAgent(EchoAgent):
+        async def handle_welcome(self, args):
+            return {"agent_id": "x", "broken_field": object()}
+
+    a = UnserializableWelcomeAgent(agent_id="unserializable", bus_url="http://localhost:1")
+    with pytest.raises(RuntimeError, match="intercepted"):
+        await a.start()
+    assert capture_connect.get("welcome") is None
 
 
 # -- helpers exist --

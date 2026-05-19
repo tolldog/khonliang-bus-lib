@@ -92,8 +92,12 @@ class BusConnector:
         """Connect to the bus and register.
 
         ``launch_spec`` declares how to re-spawn an agent of this id
-        (executable, argv, cwd, config). ``launch_info`` describes the
-        process currently serving this id (pid, started_at, git info).
+        (``executable``, ``args``, ``cwd``, ``config`` — ``args`` is the
+        trailing argument list, NOT prefixed with the interpreter; a
+        consumer respawns via ``[executable] + args``). ``launch_info``
+        describes the process currently serving this id (``started_at``
+        as wall-clock epoch + best-effort git fields; ``pid`` lives at
+        the top of this payload, not in ``launch_info``).
         Older buses ignore unknown fields; older agents that don't pass
         these keep the prior register-payload shape working. See
         :mod:`khonliang_bus.launch` and ``fr_khonliang-bus-lib_2cfc0de6``

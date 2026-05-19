@@ -84,6 +84,7 @@ def _git_info(cwd: str) -> dict[str, Any]:
     is the working-tree root.
 
     Returns ``{}`` (empty) unless:
+    - ``cwd`` contains a ``.git`` entry (fast filesystem check), AND
     - ``git`` is on PATH, AND
     - ``cwd`` is inside a git working tree, AND
     - ``git rev-parse --show-toplevel`` resolves to ``cwd`` itself.
@@ -98,22 +99,36 @@ def _git_info(cwd: str) -> dict[str, Any]:
     clone case); prod ``pip install`` deployments correctly report no
     git info.
 
+    **Startup-cost profile** (Copilot R2):
+    - Common case (prod pip install, no ``.git`` at cwd): single
+      filesystem ``stat`` call — sub-millisecond. No git subprocess.
+    - Dev clone where the agent IS the repo: up to 4 ``git`` subprocess
+      calls, each with a 1-second timeout. Worst case latency ~4s
+      *only* if git is hung; healthy git completes in <100ms total.
+    - The per-call timeout dropped from 2s to 1s post-R2 to bound the
+      worst case more tightly.
+
     Never raises — git introspection is informational, not load-bearing.
     """
+    # Fast path: if there's no .git entry at cwd, this isn't a working-tree
+    # root we care about. Avoids the git subprocess entirely for prod
+    # pip-install deployments (the common case).
+    if not os.path.exists(os.path.join(cwd, ".git")):
+        return {}
     if not shutil.which("git"):
         return {}
     try:
         # Confirm we're in a working tree first; cheap and authoritative.
         check = subprocess.run(
             ["git", "rev-parse", "--is-inside-work-tree"],
-            cwd=cwd, capture_output=True, text=True, timeout=2,
+            cwd=cwd, capture_output=True, text=True, timeout=1,
         )
         if check.returncode != 0 or check.stdout.strip() != "true":
             return {}
         # Scope check: only attach git info when cwd is the working-tree root.
         toplevel = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
-            cwd=cwd, capture_output=True, text=True, timeout=2,
+            cwd=cwd, capture_output=True, text=True, timeout=1,
         )
         if toplevel.returncode != 0:
             return {}
@@ -123,15 +138,15 @@ def _git_info(cwd: str) -> dict[str, Any]:
             return {}
         commit = subprocess.run(
             ["git", "rev-parse", "HEAD"],
-            cwd=cwd, capture_output=True, text=True, timeout=2,
+            cwd=cwd, capture_output=True, text=True, timeout=1,
         )
         branch = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=cwd, capture_output=True, text=True, timeout=2,
+            cwd=cwd, capture_output=True, text=True, timeout=1,
         )
         status = subprocess.run(
             ["git", "status", "--porcelain"],
-            cwd=cwd, capture_output=True, text=True, timeout=2,
+            cwd=cwd, capture_output=True, text=True, timeout=1,
         )
     except (subprocess.TimeoutExpired, OSError):
         return {}

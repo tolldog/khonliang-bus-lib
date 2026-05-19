@@ -721,12 +721,17 @@ class BaseAgent:
         # private ``_compose_welcome``), an agent that overrides
         # ``handle_welcome`` to customize welcome shape sees its
         # customization reflected in the persisted-at-register welcome too.
+        #
+        # Strict acceptance: ``_skills`` must be a list of ``Skill`` instances.
+        # Anything else (list of strings, dicts, mixed types — possible if
+        # an external MCP caller injects the key) falls back to the safe
+        # ``_all_skills()`` path so ``_compose_welcome`` doesn't crash on
+        # ``s.name`` later. Closes Copilot PR #25 R4 #1.
         precomputed = args.get("_skills")
-        skills = (
-            precomputed
-            if isinstance(precomputed, list)
-            else self._all_skills()
-        )
+        if isinstance(precomputed, list) and all(isinstance(s, Skill) for s in precomputed):
+            skills = precomputed
+        else:
+            skills = self._all_skills()
         return self._compose_welcome(skills, detail)
 
     def _compose_welcome(self, skills: list[Skill], detail: str) -> dict[str, Any]:
@@ -1190,7 +1195,14 @@ class BaseAgent:
             else:
                 try:
                     json.dumps(candidate)  # serializability check
-                except (TypeError, ValueError):
+                except Exception:
+                    # Broad catch is deliberate. ``json.dumps`` can raise more
+                    # than TypeError/ValueError — OverflowError on out-of-range
+                    # numbers (``float('inf')``, ``float('nan')``), RecursionError
+                    # on deep nesting, and custom encoders may surface anything.
+                    # Any failure here means the welcome cannot reach the bus
+                    # alive; the registration must still proceed. Closes
+                    # Copilot PR #25 R4 #2.
                     logger.exception(
                         "Agent %s: handle_welcome returned a non-JSON-"
                         "serializable dict; registering without welcome "

@@ -353,6 +353,105 @@ async def test_handle_welcome_ignores_non_list_skills_hint(agent):
     assert result["skill_count"] == 6  # full real catalog, not 0 or error
 
 
+@pytest.mark.asyncio
+async def test_handle_welcome_ignores_list_of_non_skills(agent):
+    """Copilot PR #25 R4 #1: ``_skills`` may be a list, but if elements
+    aren't ``Skill`` instances ``_compose_welcome`` would crash on
+    ``s.name``. Fall back to ``_all_skills()`` instead of trusting
+    arbitrary list contents.
+    """
+    # A list of strings — looks list-shaped but contents are wrong.
+    result_str = await agent._dispatch_request({
+        "operation": "welcome",
+        "args": {"detail": "full", "_skills": ["bogus", "values"]},
+    })
+    assert result_str["skill_count"] == 6  # fell back to real catalog
+
+    # A list of dicts (someone might pre-serialize) — also rejected.
+    result_dict = await agent._dispatch_request({
+        "operation": "welcome",
+        "args": {"detail": "full", "_skills": [{"name": "fake"}]},
+    })
+    assert result_dict["skill_count"] == 6
+
+
+@pytest.mark.asyncio
+async def test_handle_welcome_accepts_list_of_skill_instances(agent):
+    """Sanity counterpart: when ``_skills`` is a list of real ``Skill``
+    objects, it IS honored (this is the path ``start()`` uses).
+    """
+    from khonliang_bus.agent import Skill
+
+    custom_skills = [
+        Skill(name="only_one", description="trimmed catalog"),
+    ]
+    result = await agent._dispatch_request({
+        "operation": "welcome",
+        "args": {"detail": "full", "_skills": custom_skills},
+    })
+    assert result["skill_count"] == 1
+    assert "only_one" in result["skills_by_category"].get("misc", []) or any(
+        "only_one" in skills for skills in result["skills_by_category"].values()
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_survives_circular_reference_in_welcome(capture_connect):
+    """Circular references make ``json.dumps`` raise ``ValueError`` at the
+    default ``check_circular=True``. Already inside (TypeError, ValueError)
+    but a useful regression marker — the broad catch covers it cleanly.
+    """
+    class CircularWelcomeAgent(EchoAgent):
+        async def handle_welcome(self, args):
+            d: dict = {"agent_id": "x"}
+            d["loop"] = d  # circular reference
+            return d
+
+    a = CircularWelcomeAgent(agent_id="circular", bus_url="http://localhost:1")
+    with pytest.raises(RuntimeError, match="intercepted"):
+        await a.start()
+    assert capture_connect.get("welcome") is None
+
+
+@pytest.mark.asyncio
+async def test_start_survives_unexpected_exception_in_json_dumps(capture_connect, monkeypatch):
+    """Copilot PR #25 R4 #2: ``json.dumps`` can raise more than the
+    (TypeError, ValueError) pair the original catch listed —
+    ``OverflowError`` for out-of-range numbers, ``RecursionError`` for
+    extreme nesting, custom encoders surfacing anything. The broader
+    ``except Exception`` ensures none of those exotic cases bypasses
+    the guard and blocks registration.
+
+    Verified by monkeypatching ``json.dumps`` inside ``khonliang_bus.agent``
+    to raise ``OverflowError`` — independent of the runtime ``json.dumps``
+    used by the connector itself.
+    """
+    import khonliang_bus.agent as agent_mod
+
+    real_dumps = agent_mod.json.dumps
+    call_count = {"n": 0}
+
+    def fake_dumps(*a, **kw):
+        # First call is the serializability check — raise an unusual error.
+        # Subsequent calls (the connector's own dumps for the wire payload)
+        # use the real implementation so the test's "intercepted" exception
+        # path still fires.
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise OverflowError("simulated number-out-of-range")
+        return real_dumps(*a, **kw)
+
+    monkeypatch.setattr(agent_mod.json, "dumps", fake_dumps)
+
+    a = EchoAgent(agent_id="overflow", bus_url="http://localhost:1")
+    with pytest.raises(RuntimeError, match="intercepted"):
+        await a.start()
+    # OverflowError is not in (TypeError, ValueError) — pre-fix code would
+    # have let it escape. The broad catch drops welcome to None and
+    # continues with registration.
+    assert capture_connect.get("welcome") is None
+
+
 # -- helpers exist --
 
 def test_publish_is_async(agent):

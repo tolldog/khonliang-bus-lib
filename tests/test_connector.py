@@ -251,6 +251,66 @@ async def test_connect_and_register_raises_runtime_error_on_non_serializable_pay
 
 
 @pytest.mark.asyncio
+async def test_connect_and_register_raises_runtime_error_on_overflow_error(monkeypatch):
+    """Copilot PR #25 R7: ``json.dumps`` raises a wide range of exceptions
+    (``OverflowError``, ``RecursionError``, custom-encoder errors), not just
+    ``(TypeError, ValueError)``. The pre-flight serialization guard must
+    wrap ALL of them as ``RuntimeError`` to honor the documented exception
+    contract.
+
+    Verified by monkeypatching the connector's bound ``json.dumps`` to
+    raise ``OverflowError`` — independent of any payload shape.
+    """
+    import khonliang_bus.connector as connector_mod
+
+    monkeypatch.setattr(
+        connector_mod.json,
+        "dumps",
+        lambda *a, **kw: (_ for _ in ()).throw(OverflowError("synthetic")),
+    )
+
+    c = BusConnector("http://localhost:1", "test-agent")
+    with pytest.raises(RuntimeError, match="not JSON-encodable"):
+        await c.connect_and_register(
+            agent_type="test", version="0.1.0", pid=1, skills=[],
+        )
+
+
+@pytest.mark.asyncio
+async def test_send_drops_message_on_overflow_error(caplog, monkeypatch):
+    """The matching broad-catch test for ``send()``: ``OverflowError``
+    (and other non-(TypeError,ValueError) exceptions) must be caught
+    and logged-as-dropped, never propagate to the caller.
+    """
+    import logging
+    from unittest.mock import AsyncMock, MagicMock
+    from websockets.protocol import State
+
+    import khonliang_bus.connector as connector_mod
+
+    monkeypatch.setattr(
+        connector_mod.json,
+        "dumps",
+        lambda *a, **kw: (_ for _ in ()).throw(OverflowError("synthetic")),
+    )
+
+    c = BusConnector("http://localhost:1", "test-agent")
+    fake_ws = MagicMock()
+    fake_ws.send = AsyncMock()
+    fake_ws.state = State.OPEN
+    c._ws = fake_ws
+
+    with caplog.at_level(logging.WARNING):
+        await c.send({"type": "publish"})  # must not raise
+
+    fake_ws.send.assert_not_awaited()
+    assert any(
+        "not JSON-encodable" in r.message and "publish" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
 async def test_send_drops_unserializable_message_without_raising(caplog):
     """``send()`` docstring contract: warns-and-drops on problems out of
     the caller's control. A NaN/Inf or non-serializable value falls into

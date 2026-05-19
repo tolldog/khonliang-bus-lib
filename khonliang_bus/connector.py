@@ -136,7 +136,14 @@ class BusConnector:
         # method's documented contract (closes Copilot PR #25 R5 #3 / R6 #2).
         try:
             encoded = json.dumps(self._registration_payload, allow_nan=False)
-        except (TypeError, ValueError) as e:
+        except Exception as e:
+            # Broad catch (excluding ``BaseException`` so ``CancelledError``
+            # still propagates per the agent.py rationale) — ``json.dumps``
+            # raises a mix of TypeError / ValueError / OverflowError /
+            # RecursionError / custom-encoder errors depending on the
+            # offending value. The method's docstring promises any
+            # registration failure surfaces as ``RuntimeError``; wrap
+            # everything to honor that. Closes Copilot PR #25 R7 #1.
             raise RuntimeError(
                 f"Agent {self.agent_id} registration payload is not "
                 f"JSON-encodable (likely NaN/Inf or a custom object): {e}"
@@ -228,7 +235,10 @@ class BusConnector:
                         encoded = json.dumps(
                             self._registration_payload, allow_nan=False,
                         )
-                    except (TypeError, ValueError) as e:
+                    except Exception as e:
+                        # Same broad-catch rationale as the initial register
+                        # site — ``json.dumps`` failures span several
+                        # exception classes. Closes Copilot PR #25 R7 #1.
                         logger.error(
                             "Agent %s: registration payload not "
                             "JSON-encodable on reconnect (%s); will "
@@ -296,7 +306,11 @@ class BusConnector:
             # control. Closes Copilot PR #25 R5 #3 / R6 #3.
             try:
                 encoded = json.dumps(msg, allow_nan=False)
-            except (TypeError, ValueError) as e:
+            except Exception as e:
+                # Same broad-catch rationale as the register sites. ``send()``
+                # is the warn-and-drop path; any unsendable payload is logged
+                # with the offending type and discarded. Closes Copilot PR
+                # #25 R7 #1.
                 logger.warning(
                     "Agent %s: outbound message dropped (not "
                     "JSON-encodable, %s): type=%s",

@@ -710,8 +710,55 @@ class BaseAgent:
         if detail not in {"compact", "brief", "full"}:
             return {"error": f"detail must be one of compact|brief|full (got {detail!r})"}
 
-        skills = self._all_skills()
+        # ``_skills`` is a reserved internal arg used by ``start()`` to pass
+        # an already-computed skills list. Skipping the re-call into
+        # ``_all_skills()`` avoids a subtle divergence: if ``register_skills()``
+        # is dynamic / side-effecting, two calls could disagree, making the
+        # auto-published welcome's catalog drift from what bus actually
+        # registered. External callers don't supply this key; the bus's
+        # request schema doesn't advertise it. Closes Copilot PR #25 R2 / R3
+        # — by routing start() through ``handle_welcome`` (rather than the
+        # private ``_compose_welcome``), an agent that overrides
+        # ``handle_welcome`` to customize welcome shape sees its
+        # customization reflected in the persisted-at-register welcome too.
+        #
+        # Strict acceptance: ``_skills`` must be a NON-EMPTY list of
+        # ``Skill`` instances. Anything else (list of strings, dicts, mixed
+        # types — possible if an external MCP caller injects the key) falls
+        # back to the safe ``_all_skills()`` path so ``_compose_welcome``
+        # doesn't crash on ``s.name`` later. The non-empty requirement
+        # closes Copilot PR #25 R8 #1: ``all(isinstance(s, Skill) for s in
+        # [])`` is vacuously True, so an empty-list injection would
+        # otherwise force ``skill_count=0`` welcomes. ``start()`` always
+        # passes a non-empty list (``_all_skills()`` returns at least the
+        # ``BUILT_IN_SKILLS`` tuple), so the empty-list shortcut path
+        # cannot fire on the legitimate autopublish call.
+        # Closes Copilot PR #25 R4 #1 / R8 #1.
+        precomputed = args.get("_skills")
+        if (
+            isinstance(precomputed, list)
+            and precomputed  # non-empty
+            and all(isinstance(s, Skill) for s in precomputed)
+        ):
+            skills = precomputed
+        else:
+            skills = self._all_skills()
+        return self._compose_welcome(skills, detail)
 
+    def _compose_welcome(self, skills: list[Skill], detail: str) -> dict[str, Any]:
+        """Build the welcome payload from a precomputed skills list.
+
+        Factored out of ``handle_welcome`` so ``start()`` can compute
+        ``skills = self._all_skills()`` exactly once and pass it to both
+        the register handshake AND the auto-published welcome — avoiding
+        the prior subtle bug where ``register_skills()`` overrides with
+        side-effects could yield a welcome whose ``skill_count`` /
+        ``skills_by_category`` disagreed with what bus actually
+        registered. fr_khonliang-bus_f96722dd / Copilot PR #25 R2.
+
+        ``detail`` is one of ``compact``/``brief``/``full`` —
+        ``handle_welcome`` already validates the value.
+        """
         out: dict[str, Any] = {
             "agent_id": self.agent_id,
             "agent_type": self.agent_type,
@@ -1115,6 +1162,91 @@ class BaseAgent:
         launch_spec = capture_launch_spec()
         launch_info = capture_launch_info()
 
+        # Compute welcome at startup so the bus can persist it alongside the
+        # registration. Same shape as ``handle_welcome`` returns (single
+        # source of truth — no per-agent re-implementation). Bus stores this
+        # in a survives-deregister catalog so ``bus_welcome`` super-skill +
+        # ``GET /v1/agents/<id>/welcome`` work even after the agent process
+        # exits. See fr_khonliang-bus_f96722dd.
+        #
+        # Route through ``handle_welcome`` (not the private ``_compose_welcome``
+        # directly) so an agent that overrides ``handle_welcome`` to customize
+        # welcome shape sees that customization reflected in the persisted-
+        # at-register welcome too. The reserved ``_skills`` arg passes the
+        # already-computed skills list — avoids a second ``_all_skills()``
+        # call where a dynamic ``register_skills()`` override could otherwise
+        # yield a different result and make the auto-published welcome's
+        # catalog drift from what bus actually registered.
+        # fr_khonliang-bus_f96722dd / Copilot PR #25 R2 + R3.
+        #
+        # Defensive: a malformed Welcome / handle_welcome override must not
+        # block registration. Three independent failure modes get the same
+        # treatment (log + welcome=None + continue), so a buggy welcome
+        # never holds an agent off the bus:
+        #   (1) the welcome call raises.
+        #   (2) it returns a non-dict (bus's persist path expects dict).
+        #   (3) it returns a dict containing non-JSON-serializable values —
+        #       would later raise inside connect_and_register's json.dumps.
+        welcome: dict | None = None
+        try:
+            candidate = await self.handle_welcome({"detail": "full", "_skills": skills})
+        except asyncio.CancelledError:
+            # Cancellation during startup (the surrounding task got
+            # cancelled) must propagate, not get swallowed into the
+            # "welcome failed, continue registering" recovery path.
+            #
+            # Python facts (per https://docs.python.org/3/library/
+            # asyncio-exceptions.html#asyncio.CancelledError): since Py 3.8
+            # ``CancelledError`` inherits from ``BaseException`` rather than
+            # ``Exception``, so the broad ``except Exception`` below would
+            # NOT catch it on supported Python versions. This explicit
+            # ``except asyncio.CancelledError: raise`` is therefore
+            # defensive — redundant against today's stdlib but documents
+            # intent and defends against a future maintainer widening to
+            # ``except BaseException``. Closes Copilot PR #25 R5 #1 / R6 #1.
+            raise
+        except Exception:
+            logger.exception(
+                "Agent %s: handle_welcome raised at start(); "
+                "registering without welcome payload",
+                self.agent_id,
+            )
+        else:
+            if not isinstance(candidate, dict):
+                logger.warning(
+                    "Agent %s: handle_welcome returned %s, not dict; "
+                    "registering without welcome payload",
+                    self.agent_id, type(candidate).__name__,
+                )
+            else:
+                try:
+                    # ``allow_nan=False`` makes ``json.dumps`` reject NaN /
+                    # +Infinity / -Infinity (which the default lenient mode
+                    # would emit as the non-RFC tokens ``NaN`` / ``Infinity``
+                    # — invalid JSON the bus's standard parser would later
+                    # reject, breaking the register handshake). Strict mode
+                    # here means an overlooked welcome with ``inf``/``nan``
+                    # values is filtered at the agent rather than poisoning
+                    # the wire. Closes Copilot PR #25 R5 #2.
+                    json.dumps(candidate, allow_nan=False)
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    raise
+                except Exception:
+                    # Broad catch is deliberate. ``json.dumps`` raises a
+                    # mix of TypeError / ValueError / OverflowError /
+                    # RecursionError / custom-encoder errors depending on
+                    # the offending value. Any failure means the welcome
+                    # cannot reach the bus alive; registration must still
+                    # proceed. Closes Copilot PR #25 R4 #2.
+                    logger.exception(
+                        "Agent %s: handle_welcome returned a non-JSON-"
+                        "serializable dict; registering without welcome "
+                        "payload",
+                        self.agent_id,
+                    )
+                else:
+                    welcome = candidate
+
         # Connect and register (raises RuntimeError if bus is unreachable).
         # Wrap in try/finally so _http is cleaned up on failure.
         try:
@@ -1134,6 +1266,7 @@ class BaseAgent:
                 ],
                 launch_spec=launch_spec,
                 launch_info=launch_info,
+                welcome=welcome,
             )
 
         except Exception:

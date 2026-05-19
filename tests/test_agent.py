@@ -176,6 +176,356 @@ async def test_start_fails_when_bus_unreachable():
         await a.start()
 
 
+# -- start() captures welcome and routes it to connect_and_register --
+#    fr_khonliang-bus_f96722dd: bus-lib computes the agent's welcome at
+#    startup so the bus can persist it alongside the register handshake,
+#    without per-agent boilerplate.
+
+@pytest.mark.asyncio
+async def test_start_passes_welcome_to_connector(capture_connect):
+    """BaseAgent.start() computes its own welcome (via handle_welcome) and
+    forwards it to BusConnector.connect_and_register. Verified by capturing
+    the kwargs the connector receives — no real WebSocket is opened.
+    """
+    a = EchoAgent(agent_id="welcome-test", bus_url="http://localhost:1")
+    with pytest.raises(RuntimeError, match="intercepted"):
+        await a.start()
+
+    welcome = capture_connect.get("welcome")
+    assert welcome is not None, "welcome was not forwarded to connect_and_register"
+    # Single source of truth: same auto-derived shape ``handle_welcome``
+    # returns. Verify the load-bearing identity + skill-catalog fields.
+    assert welcome["agent_id"] == "welcome-test"
+    assert welcome["agent_type"] == "echo"
+    assert welcome["skill_count"] == 6  # echo, upper, fail, health_check, welcome, help
+
+
+@pytest.fixture
+def capture_connect(monkeypatch):
+    """Stub BusConnector.connect_and_register to capture kwargs without
+    opening a real WebSocket. Returns the dict the captured kwargs land
+    in, so tests can assert what start() forwarded.
+    """
+    captured: dict = {}
+
+    async def fake(self, **kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("intercepted; not opening WS")
+
+    from khonliang_bus.connector import BusConnector
+
+    monkeypatch.setattr(BusConnector, "connect_and_register", fake)
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_start_registers_without_welcome_if_handle_welcome_raises(capture_connect):
+    """Defensive: a buggy ``handle_welcome`` override (or a custom
+    ``WELCOME`` with __post_init__ that throws) must not block the agent
+    from registering. The connector receives welcome=None and the agent
+    stays callable.
+    """
+    class BrokenWelcomeAgent(EchoAgent):
+        async def handle_welcome(self, args):
+            raise ValueError("buggy override")
+
+    a = BrokenWelcomeAgent(agent_id="broken-welcome", bus_url="http://localhost:1")
+    with pytest.raises(RuntimeError, match="intercepted"):
+        await a.start()
+    assert capture_connect.get("welcome") is None
+    # Other fields still passed.
+    assert capture_connect.get("agent_type") == "echo"
+    assert capture_connect.get("skills") is not None
+
+
+@pytest.mark.asyncio
+async def test_start_registers_without_welcome_if_handle_welcome_returns_non_dict(capture_connect):
+    """Defensive: a ``handle_welcome`` override that returns a non-dict
+    (list, string, None, …) must not propagate to the bus's persist path.
+    The bus stores only dicts; a non-dict here would either be silently
+    discarded on the bus side or — worse — fail later inside
+    ``json.dumps``. Drop it at source for a clean wire shape.
+    """
+    class StringWelcomeAgent(EchoAgent):
+        async def handle_welcome(self, args):
+            return "this is not a dict"
+
+    a = StringWelcomeAgent(agent_id="string-welcome", bus_url="http://localhost:1")
+    with pytest.raises(RuntimeError, match="intercepted"):
+        await a.start()
+    assert capture_connect.get("welcome") is None
+
+
+@pytest.mark.asyncio
+async def test_start_registers_without_welcome_if_dict_is_not_json_serializable(capture_connect):
+    """Defensive: a dict containing non-JSON-serializable values (e.g. a
+    raw object, a set, a circular reference, a function reference) would
+    later fail in ``json.dumps`` inside connect_and_register and block
+    registration. The agent verifies serializability at capture time and
+    drops the value if it can't be encoded.
+    """
+    class UnserializableWelcomeAgent(EchoAgent):
+        async def handle_welcome(self, args):
+            return {"agent_id": "x", "broken_field": object()}
+
+    a = UnserializableWelcomeAgent(agent_id="unserializable", bus_url="http://localhost:1")
+    with pytest.raises(RuntimeError, match="intercepted"):
+        await a.start()
+    assert capture_connect.get("welcome") is None
+
+
+@pytest.mark.asyncio
+async def test_start_propagates_handle_welcome_override(capture_connect):
+    """Copilot PR #25 R3: an agent that overrides ``handle_welcome`` to
+    customize welcome shape must see that customization reflected in the
+    persisted-at-register welcome too. ``start()`` routes through
+    ``handle_welcome`` (not the private ``_compose_welcome``) so override
+    semantics stay symmetric between live MCP calls and the autopublish path.
+    """
+    class CustomWelcomeAgent(EchoAgent):
+        async def handle_welcome(self, args):
+            return {
+                "agent_id": self.agent_id,
+                "agent_type": self.agent_type,
+                "version": self.version,
+                "custom_marker": "override-saw-this",
+            }
+
+    a = CustomWelcomeAgent(agent_id="custom-welcome", bus_url="http://localhost:1")
+    with pytest.raises(RuntimeError, match="intercepted"):
+        await a.start()
+    welcome = capture_connect.get("welcome")
+    assert welcome is not None
+    # Override's custom marker survived the autopublish path.
+    assert welcome["custom_marker"] == "override-saw-this"
+
+
+@pytest.mark.asyncio
+async def test_start_uses_precomputed_skills_for_welcome(capture_connect):
+    """Copilot PR #25 R2: ``register_skills()`` overrides that are dynamic
+    must not cause the auto-published welcome to disagree with the
+    registered skill set. ``start()`` computes ``skills`` once and passes
+    that same list via the reserved ``_skills`` arg into ``handle_welcome``,
+    which forwards it to ``_compose_welcome`` instead of calling
+    ``_all_skills()`` again.
+
+    We verify by counting how often ``_all_skills`` runs during start():
+    exactly once.
+    """
+    call_count = {"n": 0}
+
+    class CountingAgent(EchoAgent):
+        def _all_skills(self):
+            call_count["n"] += 1
+            return super()._all_skills()
+
+    a = CountingAgent(agent_id="counted", bus_url="http://localhost:1")
+    with pytest.raises(RuntimeError, match="intercepted"):
+        await a.start()
+    # One call, total. If handle_welcome had re-called _all_skills, this
+    # would be 2 (regression marker).
+    assert call_count["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_handle_welcome_runtime_call_still_computes_skills(agent):
+    """Runtime MCP path (no ``_skills`` arg) falls back to ``_all_skills()``
+    — the reserved-arg shortcut is exclusively for ``start()``'s autopublish.
+    Verifies the override hook stays backward-compatible for live calls.
+    """
+    result = await agent._dispatch_request({"operation": "welcome", "args": {"detail": "full"}})
+    assert result["agent_id"] == "echo-test"
+    assert result["skill_count"] == 6
+    assert "skills_by_category" in result
+
+
+@pytest.mark.asyncio
+async def test_handle_welcome_ignores_non_list_skills_hint(agent):
+    """The reserved ``_skills`` arg is honored only when it's a list — a
+    malformed external caller can't poison the runtime welcome by passing
+    a non-list value via the MCP surface.
+    """
+    # Pass a non-list value; should ignore + fall back to _all_skills().
+    result = await agent._dispatch_request({
+        "operation": "welcome",
+        "args": {"detail": "full", "_skills": "not-a-list"},
+    })
+    assert result["skill_count"] == 6  # full real catalog, not 0 or error
+
+
+@pytest.mark.asyncio
+async def test_handle_welcome_ignores_empty_skills_hint(agent):
+    """Copilot PR #25 R8 #1: an external caller passing ``_skills=[]``
+    could force a welcome with ``skill_count=0`` if we accepted any list
+    that passes the all-Skill check (vacuously true for empty). The
+    fix requires the list to be non-empty before trusting it.
+
+    ``start()`` cannot legitimately hit this path because
+    ``_all_skills()`` always returns the ``BUILT_IN_SKILLS`` tuple plus
+    any subclass-declared skills — never empty.
+    """
+    result = await agent._dispatch_request({
+        "operation": "welcome",
+        "args": {"detail": "full", "_skills": []},
+    })
+    # Real catalog returned, not zero.
+    assert result["skill_count"] == 6
+
+
+@pytest.mark.asyncio
+async def test_handle_welcome_ignores_list_of_non_skills(agent):
+    """Copilot PR #25 R4 #1: ``_skills`` may be a list, but if elements
+    aren't ``Skill`` instances ``_compose_welcome`` would crash on
+    ``s.name``. Fall back to ``_all_skills()`` instead of trusting
+    arbitrary list contents.
+    """
+    # A list of strings — looks list-shaped but contents are wrong.
+    result_str = await agent._dispatch_request({
+        "operation": "welcome",
+        "args": {"detail": "full", "_skills": ["bogus", "values"]},
+    })
+    assert result_str["skill_count"] == 6  # fell back to real catalog
+
+    # A list of dicts (someone might pre-serialize) — also rejected.
+    result_dict = await agent._dispatch_request({
+        "operation": "welcome",
+        "args": {"detail": "full", "_skills": [{"name": "fake"}]},
+    })
+    assert result_dict["skill_count"] == 6
+
+
+@pytest.mark.asyncio
+async def test_handle_welcome_accepts_list_of_skill_instances(agent):
+    """Sanity counterpart: when ``_skills`` is a list of real ``Skill``
+    objects, it IS honored (this is the path ``start()`` uses).
+    """
+    from khonliang_bus.agent import Skill
+
+    custom_skills = [
+        Skill(name="only_one", description="trimmed catalog"),
+    ]
+    result = await agent._dispatch_request({
+        "operation": "welcome",
+        "args": {"detail": "full", "_skills": custom_skills},
+    })
+    assert result["skill_count"] == 1
+    assert "only_one" in result["skills_by_category"].get("misc", []) or any(
+        "only_one" in skills for skills in result["skills_by_category"].values()
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_drops_welcome_with_nan_or_inf(capture_connect):
+    """Copilot PR #25 R5 #2: a welcome containing NaN / +Infinity / -Infinity
+    values fails the strict ``allow_nan=False`` serializability check
+    and is dropped. Default ``json.dumps`` would happily emit the non-
+    RFC tokens (``NaN``, ``Infinity``) — invalid JSON the bus's parser
+    would later reject, breaking the register handshake.
+    """
+    class NanWelcomeAgent(EchoAgent):
+        async def handle_welcome(self, args):
+            return {"agent_id": "x", "score": float("nan")}
+
+    a = NanWelcomeAgent(agent_id="nan", bus_url="http://localhost:1")
+    with pytest.raises(RuntimeError, match="intercepted"):
+        await a.start()
+    assert capture_connect.get("welcome") is None
+
+
+@pytest.mark.asyncio
+async def test_start_drops_welcome_with_infinity(capture_connect):
+    """Same class as NaN — strict-mode serializability filter."""
+    class InfWelcomeAgent(EchoAgent):
+        async def handle_welcome(self, args):
+            return {"agent_id": "x", "size": float("inf")}
+
+    a = InfWelcomeAgent(agent_id="inf", bus_url="http://localhost:1")
+    with pytest.raises(RuntimeError, match="intercepted"):
+        await a.start()
+    assert capture_connect.get("welcome") is None
+
+
+@pytest.mark.asyncio
+async def test_start_propagates_cancellation_during_handle_welcome(capture_connect):
+    """Copilot PR #25 R5 #1: ``asyncio.CancelledError`` (Py 3.8+: now a
+    BaseException subclass, but defensible to handle explicitly) must
+    propagate, not get swallowed by the welcome-failure recovery path.
+    Otherwise a cancelled startup would silently continue to register
+    instead of cooperatively unwinding.
+    """
+    import asyncio
+
+    class CancellingWelcomeAgent(EchoAgent):
+        async def handle_welcome(self, args):
+            raise asyncio.CancelledError()
+
+    a = CancellingWelcomeAgent(agent_id="cancelled", bus_url="http://localhost:1")
+    # The CancelledError propagates out of start() — not caught by the
+    # broad except Exception block.
+    with pytest.raises(asyncio.CancelledError):
+        await a.start()
+    # And the register call never happened (connector was never invoked).
+    assert "welcome" not in capture_connect
+    assert "agent_type" not in capture_connect
+
+
+@pytest.mark.asyncio
+async def test_start_survives_circular_reference_in_welcome(capture_connect):
+    """Circular references make ``json.dumps`` raise ``ValueError`` at the
+    default ``check_circular=True``. Already inside (TypeError, ValueError)
+    but a useful regression marker — the broad catch covers it cleanly.
+    """
+    class CircularWelcomeAgent(EchoAgent):
+        async def handle_welcome(self, args):
+            d: dict = {"agent_id": "x"}
+            d["loop"] = d  # circular reference
+            return d
+
+    a = CircularWelcomeAgent(agent_id="circular", bus_url="http://localhost:1")
+    with pytest.raises(RuntimeError, match="intercepted"):
+        await a.start()
+    assert capture_connect.get("welcome") is None
+
+
+@pytest.mark.asyncio
+async def test_start_survives_unexpected_exception_in_json_dumps(capture_connect, monkeypatch):
+    """Copilot PR #25 R4 #2: ``json.dumps`` can raise more than the
+    (TypeError, ValueError) pair the original catch listed —
+    ``OverflowError`` for out-of-range numbers, ``RecursionError`` for
+    extreme nesting, custom encoders surfacing anything. The broader
+    ``except Exception`` ensures none of those exotic cases bypasses
+    the guard and blocks registration.
+
+    Verified by monkeypatching ``json.dumps`` inside ``khonliang_bus.agent``
+    to raise ``OverflowError`` — independent of the runtime ``json.dumps``
+    used by the connector itself.
+    """
+    import khonliang_bus.agent as agent_mod
+
+    real_dumps = agent_mod.json.dumps
+    call_count = {"n": 0}
+
+    def fake_dumps(*a, **kw):
+        # First call is the serializability check — raise an unusual error.
+        # Subsequent calls (the connector's own dumps for the wire payload)
+        # use the real implementation so the test's "intercepted" exception
+        # path still fires.
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise OverflowError("simulated number-out-of-range")
+        return real_dumps(*a, **kw)
+
+    monkeypatch.setattr(agent_mod.json, "dumps", fake_dumps)
+
+    a = EchoAgent(agent_id="overflow", bus_url="http://localhost:1")
+    with pytest.raises(RuntimeError, match="intercepted"):
+        await a.start()
+    # OverflowError is not in (TypeError, ValueError) — pre-fix code would
+    # have let it escape. The broad catch drops welcome to None and
+    # continues with registration.
+    assert capture_connect.get("welcome") is None
+
+
 # -- helpers exist --
 
 def test_publish_is_async(agent):

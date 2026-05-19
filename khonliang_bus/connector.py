@@ -88,6 +88,7 @@ class BusConnector:
         collaborations: list[dict] | None = None,
         launch_spec: dict | None = None,
         launch_info: dict | None = None,
+        welcome: dict | None = None,
     ) -> None:
         """Connect to the bus and register.
 
@@ -97,7 +98,12 @@ class BusConnector:
         consumer respawns via ``[executable] + args``). ``launch_info``
         describes the process currently serving this id (``started_at``
         as wall-clock epoch + best-effort git fields; ``pid`` lives at
-        the top of this payload, not in ``launch_info``).
+        the top of this payload, not in ``launch_info``). ``welcome``
+        is the same dict shape ``handle_welcome`` returns — bus persists
+        it in a survives-deregister catalog so cold-start LLMs can
+        consult it via ``GET /v1/agents/<id>/welcome`` (or the
+        ``bus_welcome`` super-skill) even after the agent process
+        exits. See ``fr_khonliang-bus_f96722dd``.
         Older buses ignore unknown fields; older agents that don't pass
         these keep the prior register-payload shape working. See
         :mod:`khonliang_bus.launch` and ``fr_khonliang-bus-lib_2cfc0de6``
@@ -118,6 +124,30 @@ class BusConnector:
             self._registration_payload["launch_spec"] = launch_spec
         if launch_info is not None:
             self._registration_payload["launch_info"] = launch_info
+        if welcome is not None:
+            self._registration_payload["welcome"] = welcome
+
+        # Validate serializability BEFORE opening the websocket — a bad
+        # payload (NaN/Inf or non-serializable values) should fail fast
+        # without holding a socket. ``allow_nan=False`` makes ``json.dumps``
+        # reject NaN/Inf (which default lenient mode emits as the non-RFC
+        # tokens the bus would later fail to parse). Wrapped so the
+        # serialization failure surfaces as ``RuntimeError``, matching the
+        # method's documented contract (closes Copilot PR #25 R5 #3 / R6 #2).
+        try:
+            encoded = json.dumps(self._registration_payload, allow_nan=False)
+        except Exception as e:
+            # Broad catch (excluding ``BaseException`` so ``CancelledError``
+            # still propagates per the agent.py rationale) — ``json.dumps``
+            # raises a mix of TypeError / ValueError / OverflowError /
+            # RecursionError / custom-encoder errors depending on the
+            # offending value. The method's docstring promises any
+            # registration failure surfaces as ``RuntimeError``; wrap
+            # everything to honor that. Closes Copilot PR #25 R7 #1.
+            raise RuntimeError(
+                f"Agent {self.agent_id} registration payload is not "
+                f"JSON-encodable (likely NaN/Inf or a custom object): {e}"
+            ) from e
 
         ws_url = self._ws_url("/v1/agent")
         try:
@@ -128,8 +158,7 @@ class BusConnector:
                 f"{ws_url}: {e}. The bus must be running before agents can start."
             ) from e
 
-        # Send registration
-        await self._ws.send(json.dumps(self._registration_payload))
+        await self._ws.send(encoded)
         resp = json.loads(await self._ws.recv())
         if resp.get("type") != "registered":
             await self._ws.close()
@@ -196,7 +225,29 @@ class BusConnector:
                 ws_url = self._ws_url("/v1/agent")
                 new_ws = await websockets.connect(ws_url)
                 if self._registration_payload:
-                    await new_ws.send(json.dumps(self._registration_payload))
+                    # ``allow_nan=False`` — same strict-encoding rationale as
+                    # the initial register call. On the reconnect path we
+                    # log + close + propagate via the surrounding
+                    # ``except Exception`` rather than via ``RuntimeError``,
+                    # since ``run()`` already absorbs reconnect failures
+                    # and retries with backoff. Closes Copilot PR #25 R5 #3 / R6 #2.
+                    try:
+                        encoded = json.dumps(
+                            self._registration_payload, allow_nan=False,
+                        )
+                    except Exception as e:
+                        # Same broad-catch rationale as the initial register
+                        # site — ``json.dumps`` failures span several
+                        # exception classes. Closes Copilot PR #25 R7 #1.
+                        logger.error(
+                            "Agent %s: registration payload not "
+                            "JSON-encodable on reconnect (%s); will "
+                            "retry after backoff",
+                            self.agent_id, e,
+                        )
+                        await new_ws.close()
+                        raise
+                    await new_ws.send(encoded)
                     resp = json.loads(await new_ws.recv())
                     if resp.get("type") != "registered":
                         await new_ws.close()
@@ -240,13 +291,46 @@ class BusConnector:
     async def send(self, msg: dict) -> None:
         """Send a message to the bus.
 
-        Logs a warning and drops the message if the WebSocket is not open.
+        Two warn-and-drop conditions; neither raises:
+
+        - WebSocket is not open (the original behavior).
+        - ``msg`` contains values that ``json.dumps(..., allow_nan=False)``
+          can't encode — NaN / Infinity, ``object()``, ``set``, custom
+          objects without an encoder, or anything that triggers
+          ``OverflowError`` / ``RecursionError`` / a custom-encoder error.
+          Strict encoding here prevents non-RFC JSON from poisoning the
+          bus's parser; a dropped message is preferable to a wire-level
+          protocol error.
+
         Callers that need delivery guarantees should check
         :attr:`connected` themselves (or use the higher-level
-        :meth:`~khonliang_bus.agent.BaseAgent.publish` which raises on disconnect).
+        :meth:`~khonliang_bus.agent.BaseAgent.publish` which raises on
+        disconnect). There is currently no surface that raises on
+        serialization failure — the log line is the only signal that an
+        outbound message was dropped for that reason.
         """
         if self._ws and self._is_open():
-            await self._ws.send(json.dumps(msg))
+            # ``allow_nan=False`` — strict-encoding for all outbound wire
+            # messages (responses, publishes, gaps, feedback). Catches
+            # NaN/Inf bugs in skill responses at send rather than poisoning
+            # the bus's JSON parser. Serialization failures (NaN/Inf, custom
+            # objects) are logged + dropped — matching the docstring's
+            # "warns-and-drops" contract for problems out of the caller's
+            # control. Closes Copilot PR #25 R5 #3 / R6 #3.
+            try:
+                encoded = json.dumps(msg, allow_nan=False)
+            except Exception as e:
+                # Same broad-catch rationale as the register sites. ``send()``
+                # is the warn-and-drop path; any unsendable payload is logged
+                # with the offending type and discarded. Closes Copilot PR
+                # #25 R7 #1.
+                logger.warning(
+                    "Agent %s: outbound message dropped (not "
+                    "JSON-encodable, %s): type=%s",
+                    self.agent_id, e, msg.get("type"),
+                )
+                return
+            await self._ws.send(encoded)
         else:
             logger.warning(
                 "Agent %s: message dropped (not connected): type=%s",

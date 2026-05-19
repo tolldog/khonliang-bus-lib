@@ -45,6 +45,7 @@ from typing import Any, Callable, Mapping
 import httpx
 
 from khonliang_bus.connector import BusConnector
+from khonliang_bus.launch import capture_launch_info, capture_launch_spec
 from khonliang_bus.registry import (
     ExecutionProfile,
     OutputContract,
@@ -1102,6 +1103,18 @@ class BaseAgent:
             on_request=self._dispatch_request,
         )
 
+        # Capture launch metadata at startup. ``launch_spec`` carries the
+        # declarative how-to-launch fields (executable, args, cwd, config) —
+        # what the bus needs to spawn another process matching this agent_id.
+        # ``launch_info`` carries the runtime snapshot (started_at, git
+        # info) — what process is currently serving this agent_id; pid is
+        # the top-level register payload field, not duplicated in
+        # launch_info. Bus joins both to surface canonical-vs-ad-hoc
+        # provenance. See fr_khonliang-bus-lib_2cfc0de6 (launch_spec) +
+        # fr_khonliang-bus-lib_cccaa6a9 (launch_info).
+        launch_spec = capture_launch_spec()
+        launch_info = capture_launch_info()
+
         # Connect and register (raises RuntimeError if bus is unreachable).
         # Wrap in try/finally so _http is cleaned up on failure.
         try:
@@ -1119,6 +1132,8 @@ class BaseAgent:
                     }
                     for c in collabs
                 ],
+                launch_spec=launch_spec,
+                launch_info=launch_info,
             )
 
         except Exception:
